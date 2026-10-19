@@ -7,3 +7,6 @@
 
 pub mod soroban;
 pub mod wasm;
+
+// Re-export for external test use.
+pub use soroban::diff::{diff_specs, Compatibility, SpecDiff};

@@ -8,6 +8,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+// Re-export for integration tests.
+pub use sorob_inspect::soroban::decode_spec_from_wasm;
+
 #[derive(Parser)]
 #[command(
     name = "sorob-inspect",
@@ -89,10 +92,14 @@ fn run(cli: Cli) -> Result<(), String> {
                 println!("generic wasm validation: PASS");
                 println!("soroban spec section: {}", report.has_contract_spec);
                 println!("soroban env meta section: {}", report.has_contract_env_meta);
+                if let Some(spec) = &report.spec {
+                    println!("spec functions: {}", spec.functions.len());
+                    println!("spec types: {}", spec.types.len());
+                }
                 println!("summary: {}", report.summary);
                 println!();
                 println!(
-                    "note: soroban marker detection only — contract-spec decoding not implemented."
+                    "note: contract-spec decoding implemented; full ABI compatibility not assessed."
                 );
             }
         }
@@ -102,10 +109,50 @@ fn run(cli: Cli) -> Result<(), String> {
             let old_report = inspect(&old_bytes, false).map_err(|e| e.to_string())?;
             let new_report = inspect(&new_bytes, false).map_err(|e| e.to_string())?;
             let diff = build_diff(&old_report, &new_report);
+
+            // Spec-level diff: only when both specs decode successfully.
+            let spec_diff = match (
+                sorob_inspect::soroban::decode_spec_from_wasm(&old_bytes),
+                sorob_inspect::soroban::decode_spec_from_wasm(&new_bytes),
+            ) {
+                (Ok(o), Ok(n)) => Some(sorob_inspect::soroban::diff::diff_specs(&o, &n)),
+                _ => None,
+            };
+
             if json {
-                print_json(&diff)?;
+                print_json(&serde_json::json!({
+                    "structural": diff,
+                    "spec": spec_diff,
+                }))?;
             } else {
                 print_diff(&old, &new, &diff);
+                if let Some(sd) = &spec_diff {
+                    println!();
+                    println!("spec-level compatibility: {:?}", sd.compatibility);
+                    for a in &sd.functions_added {
+                        println!("  + function {a}");
+                    }
+                    for r in &sd.functions_removed {
+                        println!("  - function {r}");
+                    }
+                    for c in &sd.functions_changed {
+                        let marker = if c.breaking {
+                            "BREAKING"
+                        } else {
+                            "non-breaking"
+                        };
+                        println!("  ~ function {}: {} ({marker})", c.name, c.detail);
+                    }
+                    for t in &sd.types_added {
+                        println!("  + type {t}");
+                    }
+                    for t in &sd.types_removed {
+                        println!("  - type {t}");
+                    }
+                } else {
+                    println!();
+                    println!("spec-level compatibility: unknown (one or both specs could not be decoded)");
+                }
             }
         }
     }
@@ -225,5 +272,5 @@ fn print_diff(old: &Path, new: &Path, d: &DiffReport) {
     }
 
     println!();
-    println!("abi compatibility: NOT ASSESSED (contract-spec decoding not implemented)");
+    println!("abi compatibility: structural diff only — see spec-level result below");
 }

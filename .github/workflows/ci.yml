@@ -15,11 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal
-          override: true
           components: rustfmt
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -29,11 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
       - name: cargo test --locked
         run: cargo test --locked
 
@@ -42,11 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal
-          override: true
           components: clippy
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
