@@ -40,8 +40,11 @@ pub struct SorobanReport {
 pub struct SpecReport {
     /// Exported contract functions from the spec.
     pub functions: Vec<SpecFunction>,
-    /// User-defined type declarations (structs, unions, enums, error enums, events).
+    /// User-defined type declarations (structs, unions, enums, error enums).
     pub types: Vec<SpecType>,
+    /// Contract events (separate from UDTs).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<SpecEvent>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +70,38 @@ pub struct SpecType {
     /// Kind of UDT: "struct", "union", "enum", "error_enum", or "event".
     pub kind: String,
     pub name: String,
+    /// Fields for structs (name + type), empty for other kinds.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<SpecField>,
+    /// Case names for unions/enums/error enums.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cases: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpecField {
+    pub name: String,
+    pub type_: String,
+}
+
+/// A decoded contract event, separate from UDTs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecEvent {
+    pub name: String,
+    /// Topic prefix names.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefix_topics: Vec<String>,
+    /// Event parameters with their location ("topic" or "data").
+    pub params: Vec<SpecEventParam>,
+    /// Data format: "single_value" or "vec".
+    pub data_format: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecEventParam {
+    pub name: String,
+    pub type_: String,
+    pub location: String,
 }
 
 /// Errors from Soroban inspection.
@@ -126,9 +161,10 @@ pub fn inspect_soroban(bytes: &[u8], validate: bool) -> Result<SorobanReport, So
 
     let summary = match (&spec, has_contract_spec, has_contract_env_meta) {
         (Some(s), true, true) => format!(
-            "Soroban contract artifact: {} function(s), {} type(s) decoded from contractspecv0.",
+            "Soroban contract artifact: {} function(s), {} type(s), {} event(s) decoded from contractspecv0.",
             s.functions.len(),
-            s.types.len()
+            s.types.len(),
+            s.events.len()
         ),
         (_, true, true) => {
             "Soroban contract artifact detected (contractspecv0 + contractenvmetav0 present)."
@@ -198,6 +234,7 @@ pub fn decode_spec_raw(raw: &[u8]) -> Result<SpecReport, SorobanError> {
 
     let mut functions = Vec::new();
     let mut types = Vec::new();
+    let mut events = Vec::new();
     loop {
         match reader.next() {
             Some(Ok(entry)) => match entry {
@@ -223,22 +260,87 @@ pub fn decode_spec_raw(raw: &[u8]) -> Result<SpecReport, SorobanError> {
                 ScSpecEntry::UdtStructV0(s) => types.push(SpecType {
                     kind: "struct".to_string(),
                     name: s.name.to_string(),
+                    fields: s
+                        .fields
+                        .to_vec()
+                        .into_iter()
+                        .map(|fld| SpecField {
+                            name: fld.name.to_string(),
+                            type_: format_type_def(&fld.type_),
+                        })
+                        .collect(),
+                    cases: Vec::new(),
                 }),
                 ScSpecEntry::UdtUnionV0(u) => types.push(SpecType {
                     kind: "union".to_string(),
                     name: u.name.to_string(),
+                    fields: Vec::new(),
+                    cases: u
+                        .cases
+                        .to_vec()
+                        .into_iter()
+                        .map(|c| match c {
+                            stellar_xdr::ScSpecUdtUnionCaseV0::TupleV0(t) => {
+                                format!("Tuple({})", t.name)
+                            }
+                            stellar_xdr::ScSpecUdtUnionCaseV0::VoidV0(v) => {
+                                format!("Void({})", v.name)
+                            }
+                        })
+                        .collect(),
                 }),
                 ScSpecEntry::UdtEnumV0(e) => types.push(SpecType {
                     kind: "enum".to_string(),
                     name: e.name.to_string(),
+                    fields: Vec::new(),
+                    cases: e
+                        .cases
+                        .to_vec()
+                        .into_iter()
+                        .map(|c| c.name.to_string())
+                        .collect(),
                 }),
                 ScSpecEntry::UdtErrorEnumV0(e) => types.push(SpecType {
                     kind: "error_enum".to_string(),
                     name: e.name.to_string(),
+                    fields: Vec::new(),
+                    cases: e
+                        .cases
+                        .to_vec()
+                        .into_iter()
+                        .map(|c| c.name.to_string())
+                        .collect(),
                 }),
-                ScSpecEntry::EventV0(ev) => types.push(SpecType {
-                    kind: "event".to_string(),
+                ScSpecEntry::EventV0(ev) => events.push(SpecEvent {
                     name: ev.name.to_string(),
+                    prefix_topics: ev
+                        .prefix_topics
+                        .to_vec()
+                        .into_iter()
+                        .map(|t| t.to_string())
+                        .collect(),
+                    params: ev
+                        .params
+                        .to_vec()
+                        .into_iter()
+                        .map(|p| SpecEventParam {
+                            name: p.name.to_string(),
+                            type_: format_type_def(&p.type_),
+                            location: match p.location {
+                                stellar_xdr::ScSpecEventParamLocationV0::Data => "data".to_string(),
+                                stellar_xdr::ScSpecEventParamLocationV0::TopicList => {
+                                    "topic".to_string()
+                                }
+                            },
+                        })
+                        .collect(),
+                    data_format: match ev.data_format {
+                        stellar_xdr::ScSpecEventDataFormat::SingleValue => {
+                            "single_value".to_string()
+                        }
+                        stellar_xdr::ScSpecEventDataFormat::Vec => "vec".to_string(),
+                        stellar_xdr::ScSpecEventDataFormat::Map => "map".to_string(),
+                    },
                 }),
             },
             Some(Err(e)) => return Err(SorobanError::SpecDecode(e.to_string())),
@@ -246,7 +348,11 @@ pub fn decode_spec_raw(raw: &[u8]) -> Result<SpecReport, SorobanError> {
         }
     }
 
-    Ok(SpecReport { functions, types })
+    Ok(SpecReport {
+        functions,
+        types,
+        events,
+    })
 }
 
 /// Render an `ScSpecTypeDef` as a compact human-readable type string.

@@ -20,6 +20,14 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_soroban.wasm")
 }
 
+fn udt_a_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/udt_contract_a.wasm")
+}
+
+fn udt_b_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/udt_contract_b.wasm")
+}
+
 #[test]
 fn test_inspect_valid_empty_wasm() {
     // Magic + version only — the smallest valid WASM module.
@@ -121,4 +129,110 @@ fn test_real_fixture_json_contains_decoded_functions() {
     assert!(json.contains("has_contract_spec"));
     assert!(json.contains("functions"));
     assert!(json.contains("true"));
+}
+
+// --- UDT fixture tests (Task 2-3) ---
+
+#[test]
+fn test_udt_fixture_a_decodes_struct_fields() {
+    let path = udt_a_path();
+    let wasm = fs::read(&path).expect("fixture missing");
+    let report = inspect_soroban(&wasm, true).expect("fixture should validate+decode");
+    let spec = report.spec.as_ref().unwrap();
+    let config = spec
+        .types
+        .iter()
+        .find(|t| t.name == "Config")
+        .expect("Config struct should be present");
+    assert_eq!(config.kind, "struct");
+    assert!(!config.fields.is_empty());
+    assert!(config
+        .fields
+        .iter()
+        .any(|f| f.name == "owner" && f.type_ == "Address"));
+}
+
+#[test]
+fn test_udt_fixture_a_decodes_union_cases() {
+    let path = udt_a_path();
+    let wasm = fs::read(&path).expect("fixture missing");
+    let report = inspect_soroban(&wasm, true).expect("fixture should validate+decode");
+    let spec = report.spec.as_ref().unwrap();
+    let status = spec
+        .types
+        .iter()
+        .find(|t| t.name == "Status")
+        .expect("Status union should be present");
+    assert_eq!(status.kind, "union");
+    assert!(!status.cases.is_empty());
+    assert!(status.cases.iter().any(|c| c.contains("Pending")));
+}
+
+#[test]
+fn test_udt_fixture_a_decodes_event() {
+    let path = udt_a_path();
+    let wasm = fs::read(&path).expect("fixture missing");
+    let report = inspect_soroban(&wasm, true).expect("fixture should validate+decode");
+    let spec = report.spec.as_ref().unwrap();
+    assert!(!spec.events.is_empty());
+    let ev = &spec.events[0];
+    assert!(!ev.params.is_empty());
+    assert!(!ev.prefix_topics.is_empty());
+}
+
+// --- Diff tests (Task 4-5) ---
+
+#[test]
+fn test_udt_diff_detects_struct_field_added() {
+    let a = fs::read(udt_a_path()).expect("fixture missing");
+    let b = fs::read(udt_b_path()).expect("fixture missing");
+    let a_report = inspect_soroban(&a, false).expect("A should decode");
+    let b_report = inspect_soroban(&b, false).expect("B should decode");
+    let diff = sorob_inspect::soroban::diff::diff_specs(
+        a_report.spec.as_ref().unwrap(),
+        b_report.spec.as_ref().unwrap(),
+    );
+    assert_eq!(
+        diff.compatibility,
+        sorob_inspect::soroban::diff::Compatibility::Breaking
+    );
+    let config_change = diff
+        .types_changed
+        .iter()
+        .find(|c| c.name == "Config")
+        .expect("Config change detected");
+    assert!(config_change.breaking);
+    assert!(config_change.detail.contains("count"));
+}
+
+#[test]
+fn test_udt_diff_detects_enum_variant_removed() {
+    let a = fs::read(udt_a_path()).expect("fixture missing");
+    let b = fs::read(udt_b_path()).expect("fixture missing");
+    let a_report = inspect_soroban(&a, false).expect("A should decode");
+    let b_report = inspect_soroban(&b, false).expect("B should decode");
+    let diff = sorob_inspect::soroban::diff::diff_specs(
+        a_report.spec.as_ref().unwrap(),
+        b_report.spec.as_ref().unwrap(),
+    );
+    let status_change = diff
+        .types_changed
+        .iter()
+        .find(|c| c.name == "Status")
+        .expect("Status change detected");
+    assert!(status_change.breaking);
+}
+
+#[test]
+fn test_udt_diff_detects_event_removed() {
+    let a = fs::read(udt_a_path()).expect("fixture missing");
+    let b = fs::read(udt_b_path()).expect("fixture missing");
+    let a_report = inspect_soroban(&a, false).expect("A should decode");
+    let b_report = inspect_soroban(&b, false).expect("B should decode");
+    let diff = sorob_inspect::soroban::diff::diff_specs(
+        a_report.spec.as_ref().unwrap(),
+        b_report.spec.as_ref().unwrap(),
+    );
+    assert!(!diff.events_removed.is_empty());
+    assert!(diff.events_removed.contains(&"StatusEvent".to_string()));
 }

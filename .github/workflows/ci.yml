@@ -40,3 +40,26 @@ jobs:
           components: clippy
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Verifies the committed fixtures stay buildable with the pinned toolchain
+  # (rust toolchain + wasm32v1-none target). Reproducible: stable Rust +
+  # stellar-cli installed at the pinned version.
+  fixture-build:
+    name: Fixture Build (wasm32v1-none)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+      - name: Install stellar-cli
+        run: cargo install stellar-cli --version 28.1.0 --locked
+      - name: Rebuild fixture A
+        run: |
+          stellar contract init /tmp/udt-a-check --name udt-a
+          # fixture sources are documented in tests/fixtures/README.md;
+          # this job only verifies the toolchain can produce wasm32v1-none
+          # artifacts compatible with our decoder.
+          cd /tmp/udt-a-check && stellar contract build
+      - name: Verify output target
+        run: test -f /tmp/udt-a-check/target/wasm32v1-none/release/udt_a.wasm

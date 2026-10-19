@@ -20,5 +20,44 @@ Real Soroban contract WASM artifacts used by the integration tests.
 - Purpose: exercise spec-level compatibility diff (breaking param change +
   non-breaking function addition)
 
-Both fixtures are the smallest practical real-contract artifacts; committed as
+## udt_contract_a.wasm (3914 bytes)
+
+- Source: `UdtContract` with `Config` struct (owner: Address, fee: u32, active: bool),
+  `Status` union (Pending, Active, Suspended), `EventPayload` struct, `StatusEvent`
+  event (topic: id: u64, data: status: u32)
+- Built with: stellar-cli 28.1.0, soroban-sdk 28.0.0
+- Target: `wasm32v1-none`
+- Purpose: exercise struct field decoding, union case decoding, event param/topic decoding
+
+## udt_contract_b.wasm (2658 bytes)
+
+- Source: `UdtContractB` — modified version of A:
+  - `Config` struct: added `count: u32` field (breaking)
+  - `Status` union: removed `Pending`, added `Inactive` + `Suspended` (breaking)
+  - `StatusEvent` event: removed entirely (breaking)
+  - Functions: removed `init`, `process`, `emit_status`; added `set_config`
+- Built with: stellar-cli 28.1.0, soroban-sdk 28.0.0
+- Target: `wasm32v1-none`
+- Purpose: exercise spec-level compatibility diff with real UDT + event changes
+
+All fixtures are the smallest practical real-contract artifacts; committed as
 binaries intentionally for test stability.
+
+## Reproduction
+
+```bash
+# Install stellar-cli 28.1.0
+cargo install stellar-cli --version 28.1.0
+
+# Build fixture A
+stellar contract init udt-a --name udt-a
+# Copy contracts/udt-a/src/lib.rs from the source above
+cd udt-a && stellar contract build
+cp target/wasm32v1-none/release/udt_a.wasm ../tests/fixtures/udt_contract_a.wasm
+
+# Build fixture B
+stellar contract init udt-b --name udt-b
+# Copy contracts/udt-b/src/lib.rs from the source above
+cd udt-b && stellar contract build
+cp target/wasm32v1-none/release/udt_b.wasm ../tests/fixtures/udt_contract_b.wasm
+```

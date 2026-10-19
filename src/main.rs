@@ -95,6 +95,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 if let Some(spec) = &report.spec {
                     println!("spec functions: {}", spec.functions.len());
                     println!("spec types: {}", spec.types.len());
+                    println!("spec events: {}", spec.events.len());
                 }
                 println!("summary: {}", report.summary);
                 println!();
@@ -148,6 +149,28 @@ fn run(cli: Cli) -> Result<(), String> {
                     }
                     for t in &sd.types_removed {
                         println!("  - type {t}");
+                    }
+                    for tc in &sd.types_changed {
+                        let marker = if tc.breaking {
+                            "BREAKING"
+                        } else {
+                            "non-breaking"
+                        };
+                        println!("  ~ type {}: {} ({marker})", tc.name, tc.detail);
+                    }
+                    for e in &sd.events_added {
+                        println!("  + event {e}");
+                    }
+                    for e in &sd.events_removed {
+                        println!("  - event {e}");
+                    }
+                    for ec in &sd.events_changed {
+                        let marker = if ec.breaking {
+                            "BREAKING"
+                        } else {
+                            "non-breaking"
+                        };
+                        println!("  ~ event {}: {} ({marker})", ec.name, ec.detail);
                     }
                 } else {
                     println!();
