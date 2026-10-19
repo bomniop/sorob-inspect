@@ -1,0 +1,16 @@
+# Build artifacts
+/target
+Cargo.lock.bak
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Fixtures (keep small samples in tests/fixtures, ignore large dumps)
+*.wasm.bak
