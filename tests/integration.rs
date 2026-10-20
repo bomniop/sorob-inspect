@@ -337,3 +337,145 @@ fn test_identical_fixture_is_identical() {
         sorob_inspect::soroban::diff::Compatibility::Identical
     );
 }
+
+// --- --fail-on-breaking CLI gating (Task 1) ---
+
+const BIN: &str = env!("CARGO_BIN_EXE_sorob-inspect");
+
+fn run_cli(args: &[&str]) -> (i32, String, String) {
+    use std::process::Command;
+    let out = Command::new(BIN)
+        .args(args)
+        .output()
+        .expect("CLI should start");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_fail_on_breaking_breaking_diff_exits_one() {
+    let (rc, _, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/udt_contract_c.wasm",
+        "tests/fixtures/udt_contract_d.wasm",
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(rc, 1, "breaking diff must exit 1 with the flag");
+}
+
+#[test]
+fn test_fail_on_breaking_identical_diff_exits_zero() {
+    let (rc, _, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/udt_contract_c.wasm",
+        "tests/fixtures/udt_contract_c.wasm",
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(rc, 0, "identical contracts must exit 0 with the flag");
+}
+
+#[test]
+fn test_fail_on_breaking_json_output_stays_valid() {
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/udt_contract_c.wasm",
+        "tests/fixtures/udt_contract_d.wasm",
+        "--json",
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(rc, 1);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must remain valid JSON");
+    let spec = v.get("spec").expect("spec key present");
+    assert_eq!(
+        spec.get("compatibility").and_then(|c| c.as_str()),
+        Some("breaking"),
+        "JSON must carry the compatibility result"
+    );
+}
+
+#[test]
+fn test_fail_on_breaking_unknown_diff_exits_one() {
+    // Minimal valid WASM (magic + version, 8 bytes) has no contractspecv0, so
+    // the spec is undecodable -> no verdict -> must fail the build.
+    let empty = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    fs::write(
+        empty.path(),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    )
+    .expect("write empty wasm");
+    let empty_path = empty.path().to_string_lossy().to_string();
+
+    let (rc, _, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/udt_contract_c.wasm",
+        &empty_path,
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(rc, 1, "unknown compatibility must also fail the build");
+}
+
+#[test]
+fn test_without_flag_behavior_unchanged() {
+    let empty = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    fs::write(
+        empty.path(),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    )
+    .expect("write empty wasm");
+    let empty_path = empty.path().to_string_lossy().to_string();
+
+    // Without the flag the exit code is 0 whenever the diff itself ran, for
+    // both a breaking verdict and an undecodable-spec (unknown) input.
+    for args in [
+        vec![
+            "diff",
+            "tests/fixtures/udt_contract_c.wasm",
+            "tests/fixtures/udt_contract_d.wasm",
+        ],
+        vec![
+            "diff",
+            "tests/fixtures/udt_contract_c.wasm",
+            empty_path.as_str(),
+        ],
+    ] {
+        let (rc, stdout, _) = run_cli(&args);
+        assert_eq!(rc, 0, "no-flag diff must still exit 0: {args:?}");
+        assert!(!stdout.is_empty(), "report must still print");
+    }
+}
+
+#[test]
+fn test_fail_on_breaking_error_goes_to_stderr() {
+    let (rc, stdout, stderr) = run_cli(&[
+        "diff",
+        "tests/fixtures/udt_contract_c.wasm",
+        "tests/fixtures/udt_contract_d.wasm",
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(rc, 1);
+    assert!(stderr.contains("breaking or unknown"));
+    assert!(
+        !stdout.contains("breaking or unknown"),
+        "diagnostics must not contaminate stdout"
+    );
+}
+
+#[test]
+fn test_help_documents_fail_on_breaking() {
+    let (rc, stdout, _) = run_cli(&["diff", "--help"]);
+    assert_eq!(rc, 0);
+    assert!(
+        stdout.contains("--fail-on-breaking"),
+        "help must document the flag"
+    );
+}

@@ -43,8 +43,8 @@ enum Command {
     },
     /// Structural diff between two WASM artifacts.
     ///
-    /// Reports added/removed imports and exports. This is NOT an ABI
-    /// compatibility verdict — contract-spec decoding is not implemented yet.
+    /// Reports added/removed imports and exports, plus a spec-level
+    /// compatibility verdict when both contract specs decode.
     Diff {
         /// Old/baseline .wasm file
         old: PathBuf,
@@ -53,6 +53,11 @@ enum Command {
         /// Emit JSON instead of human-readable text
         #[arg(long)]
         json: bool,
+        /// Exit with code 1 when the spec-level compatibility verdict is
+        /// `breaking` or `unknown`. Without this flag the exit code is 0
+        /// whenever the diff itself ran successfully. Intended for CI gating.
+        #[arg(long)]
+        fail_on_breaking: bool,
     },
 }
 
@@ -104,7 +109,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 );
             }
         }
-        Command::Diff { old, new, json } => {
+        Command::Diff {
+            old,
+            new,
+            json,
+            fail_on_breaking,
+        } => {
             let old_bytes = read_wasm(&old)?;
             let new_bytes = read_wasm(&new)?;
             let old_report = inspect(&old_bytes, false).map_err(|e| e.to_string())?;
@@ -175,6 +185,26 @@ fn run(cli: Cli) -> Result<(), String> {
                 } else {
                     println!();
                     println!("spec-level compatibility: unknown (one or both specs could not be decoded)");
+                }
+            }
+            // CI gating: emit the report above, then map the verdict to an exit
+            // code. `breaking` and `unknown` both fail; the diff ran fine, so we
+            // exit 1 rather than returning an Err (which would print an error and
+            // skip the normal report). No diagnostics contaminate stdout.
+            if fail_on_breaking {
+                let verdict = spec_diff.as_ref().map(|sd| &sd.compatibility);
+                let fail = match verdict {
+                    None => true, // undecodable spec -> unknown -> fail
+                    Some(c) => {
+                        matches!(
+                            c,
+                            sorob_inspect::soroban::diff::Compatibility::Breaking
+                                | sorob_inspect::soroban::diff::Compatibility::Unknown
+                        )
+                    }
+                };
+                if fail {
+                    return Err("spec-level compatibility is breaking or unknown".to_string());
                 }
             }
         }
