@@ -5,7 +5,7 @@ Inspect, validate, and diff Soroban WASM artifacts from the command line.
 ## What this tool does today
 
 - `inspect` — parse a `.wasm` file and report imports, exports, custom sections, and defined function signatures.
-- `validate` — run generic WASM validation, detect Soroban contract markers (`contractspecv0`, `contractenvmetav0`), and decode the contract spec into structured data (functions, params, return types, UDTs) via `stellar-xdr`.
+- `validate` — run generic WASM validation, detect Soroban contract markers (`contractspecv0`, `contractenvmetav0`), and decode the contract spec into structured data (functions, params, return types, UDTs, events) via `stellar-xdr`.
 - `diff` — structural diff (imports/exports/custom sections) plus spec-level compatibility diff when both sides decode successfully.
 
 Stable JSON output is available for every command via `--json`.
@@ -13,13 +13,17 @@ Stable JSON output is available for every command via `--json`.
 ## What this tool does NOT do yet
 
 - Simulate or execute Soroban contracts.
-- Detect or classify events emitted by contracts.
+- Compare union tuple-case payload types or UDT enum discriminants. The decoder
+  does not read the `SCSpecUDTUnionCaseTupleV0.type` or
+  `SCSpecUDTEnumCaseV0.value` XDR fields, so a change confined to those fields
+  is not visible to `diff`. Do not treat a `non-breaking`/`identical` verdict as
+  proof for contracts that declare tuple variants or explicit enum values.
 - Claim semantic equivalence — compatibility is structural only.
 
 ## Install
 
 ```sh
-cargo install --git https://github.com/bomniop/sorob-inspect.git
+cargo install --locked --git https://github.com/bomniop/sorob-inspect.git
 ```
 
 Or from source:
@@ -72,9 +76,23 @@ and, when both specs decode, a spec-level compatibility verdict with these rules
 | Return type changed | breaking |
 | UDT added | non-breaking |
 | UDT removed | breaking |
+| Struct field added / removed / type changed | breaking |
+| Struct field renamed | breaking (reported as removal + addition) |
+| Enum or union variant added | non-breaking |
+| Enum or union variant removed | breaking |
+| UDT kind changed (e.g. struct → enum) | breaking |
+| Event added | non-breaking |
+| Event removed | breaking |
+| Event param added / removed / type changed / location changed | breaking |
+| Event param renamed | breaking (reported as removal + addition) |
+| Event topic list or data format changed | breaking |
 | One or both specs fail to decode | unknown (never guessed) |
 
 Semantic equivalence is NOT inferred from matching names alone.
+
+Not covered by these rules (see "What this tool does NOT do yet"): union
+tuple-case payload types and UDT enum discriminant values are not decoded, so a
+change confined to those fields yields `identical` rather than `unknown`.
 
 ## Output format
 
@@ -87,6 +105,11 @@ Semantic equivalence is NOT inferred from matching names alone.
 - Very large WASM files are fully loaded into memory during inspection (no streaming).
 - Only `contractspecv0` is decoded; other Soroban custom sections (e.g. `contractmetav0`) are listed but not parsed.
 - No network access; purely local analysis.
+- Fixture provenance is documented in `tests/fixtures/README.md`. The committed
+  UDT binaries were built from the original session's contract source, which is
+  not embedded in the repo, so a rebuild is not guaranteed to be byte-identical
+  (WASM layout varies with source and toolchain). Fixture integrity in CI is
+  enforced by decode + size checks, not byte equality.
 
 ## Contributing
 

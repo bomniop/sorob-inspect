@@ -19,7 +19,7 @@
 //! | Struct field added | breaking | Existing constructors/initializers may not set it |
 //! | Struct field removed | breaking | Existing code referencing it breaks |
 //! | Struct field type changed | breaking | Type mismatch |
-//! | Struct field renamed | non-breaking | Positional/structural init unaffected |
+//! | Struct field renamed | breaking | The field name is part of the encoded struct form |
 //! | Enum variant added | non-breaking | Exhaustive matches may need update but existing code works |
 //! | Enum variant removed | breaking | Existing matches on that variant break |
 //! | Union variant added | non-breaking | Same as enum variant added |
@@ -29,7 +29,7 @@
 //! | Event param added | breaking | Subscribers expecting old shape break |
 //! | Event param removed | breaking | Subscribers referencing it break |
 //! | Event param type changed | breaking | Type mismatch for subscribers |
-//! | Event param renamed | non-breaking | Positional subscribers unaffected |
+//! | Event param renamed | breaking | Conservative: a subscriber may match on the param name |
 //! | Event topic list changed | breaking | Topic filter changes affect subscribers |
 //! | Event data format changed | breaking | Subscribers parsing payload break |
 
@@ -445,25 +445,6 @@ fn compare_events(old: &SpecEvent, new: &SpecEvent) -> Vec<EventChange> {
                 detail: format!("param '{}' added", name),
                 breaking: true,
             });
-        }
-    }
-
-    // Renamed params (same type+location, different name) — non-breaking.
-    for (old_name, (old_ty, old_loc)) in &old_params {
-        if new_params.contains_key(old_name) {
-            continue;
-        }
-        for (new_name, (new_ty, new_loc)) in &new_params {
-            if old_params.contains_key(new_name) {
-                continue;
-            }
-            if old_ty == new_ty && old_loc == new_loc {
-                changes.push(EventChange {
-                    name: old.name.clone(),
-                    detail: format!("param renamed: {} -> {}", old_name, new_name),
-                    breaking: false,
-                });
-            }
         }
     }
 
@@ -937,6 +918,102 @@ mod tests {
         let e = event("Transfer", vec![], vec![("amount", "U64", "data")]);
         let a = spec(vec![], vec![], vec![e.clone()]);
         let b = spec(vec![], vec![], vec![e]);
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Identical);
+    }
+
+    // --- Regressions: prior docs contradicted the implementation ---
+
+    #[test]
+    fn struct_field_rename_is_breaking() {
+        let a = spec(
+            vec![],
+            vec![struct_with_fields("Config", vec![("owner", "Address")])],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![struct_with_fields("Config", vec![("admin", "Address")])],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        let details: Vec<&str> = d.types_changed.iter().map(|c| c.detail.as_str()).collect();
+        assert!(details.iter().any(|s| s.contains("'owner' removed")));
+        assert!(details.iter().any(|s| s.contains("'admin' added")));
+        assert!(d.types_changed.iter().all(|c| c.breaking));
+    }
+
+    #[test]
+    fn event_param_rename_is_breaking() {
+        let a = spec(
+            vec![],
+            vec![],
+            vec![event("Transfer", vec![], vec![("from", "Address", "data")])],
+        );
+        let b = spec(
+            vec![],
+            vec![],
+            vec![event(
+                "Transfer",
+                vec![],
+                vec![("sender", "Address", "data")],
+            )],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        // A rename must never surface as a non-breaking "param renamed" entry.
+        assert!(d
+            .events_changed
+            .iter()
+            .all(|c| !c.detail.contains("param renamed")));
+        assert!(d.events_changed.iter().any(|c| c.breaking));
+    }
+
+    #[test]
+    fn event_param_location_change_is_breaking() {
+        let a = spec(
+            vec![],
+            vec![],
+            vec![event("Transfer", vec![], vec![("amount", "U64", "data")])],
+        );
+        let b = spec(
+            vec![],
+            vec![],
+            vec![event("Transfer", vec![], vec![("amount", "U64", "topic")])],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(d
+            .events_changed
+            .iter()
+            .any(|c| c.detail.contains("location changed")));
+    }
+
+    #[test]
+    fn udt_kind_change_is_breaking() {
+        let a = spec(vec![], vec![udt("Thing", "struct")], vec![]);
+        let b = spec(vec![], vec![udt("Thing", "enum")], vec![]);
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(d
+            .types_changed
+            .iter()
+            .any(|c| c.detail.contains("type kind changed")));
+    }
+
+    #[test]
+    fn unaffected_by_order_of_declaration() {
+        let a = spec(
+            vec![fn_spec("a", vec![], vec![]), fn_spec("b", vec![], vec![])],
+            vec![],
+            vec![],
+        );
+        let b = spec(
+            vec![fn_spec("b", vec![], vec![]), fn_spec("a", vec![], vec![])],
+            vec![],
+            vec![],
+        );
         let d = diff_specs(&a, &b);
         assert_eq!(d.compatibility, Compatibility::Identical);
     }
