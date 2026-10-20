@@ -69,6 +69,17 @@ Real Soroban contract WASM artifacts used by the integration tests.
 - Purpose: a discriminant change with identical case names must be `breaking`
   (this was previously invisible — decoded as `identical`)
 
+## event_formats.wasm (1393 bytes) — all three event data formats
+
+- Source: `source/event_formats.rs` — three events on one contract, one per spec
+  data format: `MovedSv` (`data_format = "single-value"`), `MovedVec`
+  (`"vec"`), `MovedMap` (`"map"`)
+- Built with: stellar-cli 28.1.0, soroban-sdk 28.0.0, target `wasm32v1-none`
+- Purpose: prove the decoder represents all three `data_format` values
+  (`single_value`, `vec`, `map`) — the `map` case was undocumented before
+- Note: the SDK attribute spelling is `"single-value"` (hyphen); the decoded
+  output string is `"single_value"` (underscore), matching the XDR enum name
+
 All fixtures are the smallest practical real-contract artifacts; committed as
 binaries intentionally for test stability.
 
@@ -114,6 +125,22 @@ Expected sizes: c=1493, d=1521, e=576, f=577 bytes. Expected sha256:
 f8ec7eae7d2f8a2a3a68f975cb8bf49293d3cc044a9c50ed28652263a16455d7  udt_contract_d.wasm
 84dbccc6de00ad944ed2401b2d13e9fe035b8c96d3693d5dec0306b6064508ff  udt_contract_e.wasm
 34319f83cdc251cf9795a05fff4db4ddfda6168da4be224a95ca4c14add65344  udt_contract_f.wasm
+```
+
+### Reproducing the event-format fixture (source committed)
+
+```bash
+stellar contract init evfmt --name evfmt
+cp tests/fixtures/source/event_formats.rs evfmt/contracts/evfmt/src/lib.rs
+rm -f evfmt/contracts/evfmt/src/test.rs
+(cd evfmt && stellar contract build)
+cp evfmt/target/wasm32v1-none/release/evfmt.wasm tests/fixtures/event_formats.wasm
+```
+
+Expected size: 1393 bytes. Expected sha256:
+
+```
+15491214eb7d409b8d0b110317de90356329a27223ec839df09ed372aa8b9afb  event_formats.wasm
 ```
 
 Note: the C–F fixtures were rebuilt from the committed source with

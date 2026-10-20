@@ -479,3 +479,105 @@ fn test_help_documents_fail_on_breaking() {
         "help must document the flag"
     );
 }
+
+// --- Event data_format coverage (Task: map event data format) ---
+
+#[test]
+fn test_real_fixture_decodes_all_event_data_formats() {
+    // event_formats.wasm was built from tests/fixtures/source/event_formats.rs
+    // (soroban-sdk 28.0.0 / stellar-cli 28.1.0) with three events using the
+    // three spec data formats. This locks the decoder to all of them, so a
+    // future regression that drops "map" fails here.
+    let wasm = fs::read(fx("event_formats.wasm")).expect("fixture missing");
+    let report = inspect_soroban(&wasm, true).expect("should decode");
+    let spec = report.spec.as_ref().unwrap();
+    let formats: Vec<(String, String)> = spec
+        .events
+        .iter()
+        .map(|e| (e.name.clone(), e.data_format.clone()))
+        .collect();
+    assert!(
+        formats.contains(&("MovedSv".to_string(), "single_value".to_string())),
+        "single_value event must decode to \"single_value\": {formats:?}"
+    );
+    assert!(
+        formats.contains(&("MovedVec".to_string(), "vec".to_string())),
+        "vec event must decode to \"vec\": {formats:?}"
+    );
+    assert!(
+        formats.contains(&("MovedMap".to_string(), "map".to_string())),
+        "map event must decode to \"map\": {formats:?}"
+    );
+}
+
+#[test]
+fn test_event_data_format_change_is_breaking() {
+    use sorob_inspect::soroban::SpecEvent;
+    // map -> vec is a wire-format change for consumers of the data segment.
+    let mk = |df: &str| SpecEvent {
+        name: "Moved".to_string(),
+        prefix_topics: vec!["moved".to_string()],
+        params: vec![sorob_inspect::soroban::SpecEventParam {
+            name: "dx".to_string(),
+            type_: "U32".to_string(),
+            location: "data".to_string(),
+        }],
+        data_format: df.to_string(),
+    };
+    let d = sorob_inspect::soroban::diff::diff_specs(
+        &sorob_inspect::soroban::SpecReport {
+            functions: vec![],
+            types: vec![],
+            events: vec![mk("map")],
+        },
+        &sorob_inspect::soroban::SpecReport {
+            functions: vec![],
+            types: vec![],
+            events: vec![mk("vec")],
+        },
+    );
+    assert_eq!(
+        d.compatibility,
+        sorob_inspect::soroban::diff::Compatibility::Breaking
+    );
+    assert!(
+        d.events_changed
+            .iter()
+            .any(|c| c.breaking && c.detail.contains("data format changed")),
+        "data_format change must be reported as breaking"
+    );
+}
+
+#[test]
+fn test_event_data_format_identical_is_not_breaking() {
+    use sorob_inspect::soroban::SpecEvent;
+    // Identical data_format must not be reported as a change at all.
+    let mk = || SpecEvent {
+        name: "Moved".to_string(),
+        prefix_topics: vec!["moved".to_string()],
+        params: vec![sorob_inspect::soroban::SpecEventParam {
+            name: "dx".to_string(),
+            type_: "U32".to_string(),
+            location: "data".to_string(),
+        }],
+        data_format: "map".to_string(),
+    };
+    let d = sorob_inspect::soroban::diff::diff_specs(
+        &sorob_inspect::soroban::SpecReport {
+            functions: vec![],
+            types: vec![],
+            events: vec![mk()],
+        },
+        &sorob_inspect::soroban::SpecReport {
+            functions: vec![],
+            types: vec![],
+            events: vec![mk()],
+        },
+    );
+    assert!(
+        !d.events_changed
+            .iter()
+            .any(|c| c.detail.contains("data format")),
+        "identical data_format must not be reported as a change"
+    );
+}

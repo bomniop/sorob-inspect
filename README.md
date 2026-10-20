@@ -111,6 +111,16 @@ never downgraded to `non-breaking`.
 `spec.types_changed[].uncertain` is emitted only when true, marking changes that
 forced the overall `unknown` verdict.
 
+`spec.events[]` carries the event's data format in `data_format`, decoded from
+the spec XDR (`ScSpecEventDataFormat`). All three values are represented:
+
+- `"single_value"` — the `data` segment is a single value
+- `"vec"` — the `data` segment is a vector of values
+- `"map"` — the `data` segment is a map from symbols to values
+
+Changing an event's `data_format` between any of these is reported as breaking
+(see the compatibility table above).
+
 ## Output format
 
 - Human-readable text by default.

@@ -59,6 +59,7 @@ jobs:
           ./target/debug/sorob-inspect diff tests/fixtures/udt_contract_a.wasm tests/fixtures/udt_contract_b.wasm --json
           ./target/debug/sorob-inspect diff tests/fixtures/udt_contract_c.wasm tests/fixtures/udt_contract_d.wasm --json
           ./target/debug/sorob-inspect diff tests/fixtures/udt_contract_e.wasm tests/fixtures/udt_contract_f.wasm --json
+          ./target/debug/sorob-inspect validate tests/fixtures/event_formats.wasm --json
       - name: Verify fixture sizes are stable
         run: |
           test $(stat -c%s tests/fixtures/udt_contract_a.wasm) -eq 3914
@@ -67,3 +68,4 @@ jobs:
           test $(stat -c%s tests/fixtures/udt_contract_d.wasm) -eq 1521
           test $(stat -c%s tests/fixtures/udt_contract_e.wasm) -eq 576
           test $(stat -c%s tests/fixtures/udt_contract_f.wasm) -eq 577
+          test $(stat -c%s tests/fixtures/event_formats.wasm) -eq 1393

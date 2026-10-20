@@ -124,7 +124,9 @@ pub struct SpecEvent {
     pub prefix_topics: Vec<String>,
     /// Event parameters with their location ("topic" or "data").
     pub params: Vec<SpecEventParam>,
-    /// Data format: "single_value" or "vec".
+    /// Data format of the event's data segment, matching the
+    /// `data_format` field of the spec XDR (`ScSpecEventDataFormat`).
+    /// One of `"single_value"`, `"vec"`, or `"map"`.
     pub data_format: String,
 }
 
