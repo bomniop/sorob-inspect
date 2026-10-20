@@ -165,7 +165,12 @@ fn test_udt_fixture_a_decodes_union_cases() {
         .expect("Status union should be present");
     assert_eq!(status.kind, "union");
     assert!(!status.cases.is_empty());
-    assert!(status.cases.iter().any(|c| c.contains("Pending")));
+    // Cases are structured: name + kind preserved (Void for unit variants).
+    assert!(status.cases.iter().any(|c| c.name == "Pending"));
+    assert!(status
+        .cases
+        .iter()
+        .all(|c| c.kind == "void" || c.kind == "tuple"));
 }
 
 #[test]
@@ -235,4 +240,100 @@ fn test_udt_diff_detects_event_removed() {
     );
     assert!(!diff.events_removed.is_empty());
     assert!(diff.events_removed.contains(&"StatusEvent".to_string()));
+}
+
+// --- ABI blind-spot fixtures (tuple payload + enum discriminant) ---
+
+fn fx(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+fn diff_fixtures(old: &str, new: &str) -> sorob_inspect::soroban::diff::SpecDiff {
+    let a = fs::read(fx(old)).expect("old fixture missing");
+    let b = fs::read(fx(new)).expect("new fixture missing");
+    let a_report = inspect_soroban(&a, false).expect("old should decode");
+    let b_report = inspect_soroban(&b, false).expect("new should decode");
+    sorob_inspect::soroban::diff::diff_specs(
+        a_report.spec.as_ref().unwrap(),
+        b_report.spec.as_ref().unwrap(),
+    )
+}
+
+#[test]
+fn test_real_fixture_tuple_case_payload_is_decoded() {
+    let wasm = fs::read(fx("udt_contract_c.wasm")).expect("fixture missing");
+    let report = inspect_soroban(&wasm, true).expect("should decode");
+    let spec = report.spec.as_ref().unwrap();
+    let shape = spec
+        .types
+        .iter()
+        .find(|t| t.name == "Shape")
+        .expect("Shape union present");
+    let circle = shape
+        .cases
+        .iter()
+        .find(|c| c.name == "Circle")
+        .expect("Circle case present");
+    assert_eq!(circle.kind, "tuple");
+    assert_eq!(circle.payload, vec!["U32".to_string()]);
+    assert!(circle.value.is_none(), "union cases carry no discriminant");
+}
+
+#[test]
+fn test_real_fixture_tuple_case_payload_change_is_breaking() {
+    // udt_c has Circle(u32); udt_d has Circle(u64). Same case names — this is
+    // exactly the blind spot that used to decode as `identical`.
+    let diff = diff_fixtures("udt_contract_c.wasm", "udt_contract_d.wasm");
+    assert_eq!(
+        diff.compatibility,
+        sorob_inspect::soroban::diff::Compatibility::Breaking
+    );
+    assert!(diff
+        .types_changed
+        .iter()
+        .any(|c| c.name == "Shape" && c.detail.contains("payload changed")));
+}
+
+#[test]
+fn test_real_fixture_enum_discriminant_is_decoded() {
+    let wasm = fs::read(fx("udt_contract_e.wasm")).expect("fixture missing");
+    let report = inspect_soroban(&wasm, true).expect("should decode");
+    let spec = report.spec.as_ref().unwrap();
+    let kind = spec
+        .types
+        .iter()
+        .find(|t| t.name == "Kind")
+        .expect("Kind enum present");
+    let a = kind
+        .cases
+        .iter()
+        .find(|c| c.name == "A")
+        .expect("A present");
+    assert_eq!(a.kind, "enum");
+    assert_eq!(a.value, Some(5), "explicit discriminant must be preserved");
+}
+
+#[test]
+fn test_real_fixture_enum_discriminant_change_is_breaking() {
+    // udt_e has C = 2; udt_f has C = 7. Same case names, different wire value.
+    let diff = diff_fixtures("udt_contract_e.wasm", "udt_contract_f.wasm");
+    assert_eq!(
+        diff.compatibility,
+        sorob_inspect::soroban::diff::Compatibility::Breaking
+    );
+    assert!(diff
+        .types_changed
+        .iter()
+        .any(|c| c.name == "Kind" && c.detail.contains("discriminant changed")));
+}
+
+#[test]
+fn test_identical_fixture_is_identical() {
+    let diff = diff_fixtures("udt_contract_c.wasm", "udt_contract_c.wasm");
+    assert_eq!(
+        diff.compatibility,
+        sorob_inspect::soroban::diff::Compatibility::Identical
+    );
 }

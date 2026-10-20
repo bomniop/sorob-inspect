@@ -40,6 +40,35 @@ Real Soroban contract WASM artifacts used by the integration tests.
 - Target: `wasm32v1-none`
 - Purpose: exercise spec-level compatibility diff with real UDT + event changes
 
+## udt_contract_c.wasm (1493 bytes) — tuple-case payload baseline
+
+- Source: `source/udt_c.rs` — `Shape` union with `Circle(u32)`, `Rect(u32, u32)`,
+  `Unit`; `Kind` enum with implicit discriminants
+- Built with: stellar-cli 28.1.0, soroban-sdk 28.0.0, target `wasm32v1-none`
+- Purpose: prove union tuple-case payload types are decoded
+  (`Circle` → `kind: "tuple", payload: ["U32"]`)
+
+## udt_contract_d.wasm (1521 bytes) — tuple-case payload change
+
+- Source: `source/udt_d.rs` — identical to `udt_c.rs` except `Circle(u64)`
+- Built with: stellar-cli 28.1.0, soroban-sdk 28.0.0, target `wasm32v1-none`
+- Purpose: a payload type change with identical case names must be `breaking`
+  (this was previously invisible — decoded as `identical`)
+
+## udt_contract_e.wasm (576 bytes) — enum discriminant baseline
+
+- Source: `source/udt_e.rs` — `Kind` enum with explicit discriminants
+  `A = 5, B = 1, C = 2`
+- Built with: stellar-cli 28.1.0, soroban-sdk 28.0.0, target `wasm32v1-none`
+- Purpose: prove enum discriminant values are decoded (`value` field)
+
+## udt_contract_f.wasm (577 bytes) — enum discriminant change
+
+- Source: `source/udt_f.rs` — identical to `udt_e.rs` except `C = 7`
+- Built with: stellar-cli 28.1.0, soroban-sdk 28.0.0, target `wasm32v1-none`
+- Purpose: a discriminant change with identical case names must be `breaking`
+  (this was previously invisible — decoded as `identical`)
+
 All fixtures are the smallest practical real-contract artifacts; committed as
 binaries intentionally for test stability.
 
@@ -61,3 +90,34 @@ stellar contract init udt-b --name udt-b
 cd udt-b && stellar contract build
 cp target/wasm32v1-none/release/udt_b.wasm ../tests/fixtures/udt_contract_b.wasm
 ```
+
+### Reproducing the C–F fixtures (source committed)
+
+The exact source used for `udt_contract_c/d/e/f.wasm` is committed in
+`source/`, so these four are fully reproducible:
+
+```bash
+for f in c d e f; do
+  stellar contract init udt-$f --name udt-$f
+  cp tests/fixtures/source/udt_$f.rs udt-$f/contracts/udt-$f/src/lib.rs
+  rm -f udt-$f/contracts/udt-$f/src/test.rs
+  (cd udt-$f && stellar contract build)
+  cp udt-$f/target/wasm32v1-none/release/udt_$f.wasm \
+     tests/fixtures/udt_contract_$f.wasm
+done
+```
+
+Expected sizes: c=1493, d=1521, e=576, f=577 bytes. Expected sha256:
+
+```
+0877ff7b56a9c832c2bbb5a1ba54468c6065bf1aa2be111d03d1ff5419e668a1  udt_contract_c.wasm
+f8ec7eae7d2f8a2a3a68f975cb8bf49293d3cc044a9c50ed28652263a16455d7  udt_contract_d.wasm
+84dbccc6de00ad944ed2401b2d13e9fe035b8c96d3693d5dec0306b6064508ff  udt_contract_e.wasm
+34319f83cdc251cf9795a05fff4db4ddfda6168da4be224a95ca4c14add65344  udt_contract_f.wasm
+```
+
+Note: the C–F fixtures were rebuilt from the committed source with
+stellar-cli 28.1.0 and verified byte-identical at commit time. The A/B fixtures
+predate this session and their original source was not recovered, so they are
+not claimed byte-reproducible; their integrity is enforced by decode + size
+checks in CI.

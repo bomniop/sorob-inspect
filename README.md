@@ -13,11 +13,6 @@ Stable JSON output is available for every command via `--json`.
 ## What this tool does NOT do yet
 
 - Simulate or execute Soroban contracts.
-- Compare union tuple-case payload types or UDT enum discriminants. The decoder
-  does not read the `SCSpecUDTUnionCaseTupleV0.type` or
-  `SCSpecUDTEnumCaseV0.value` XDR fields, so a change confined to those fields
-  is not visible to `diff`. Do not treat a `non-breaking`/`identical` verdict as
-  proof for contracts that declare tuple variants or explicit enum values.
 - Claim semantic equivalence — compatibility is structural only.
 
 ## Install
@@ -80,6 +75,10 @@ and, when both specs decode, a spec-level compatibility verdict with these rules
 | Struct field renamed | breaking (reported as removal + addition) |
 | Enum or union variant added | non-breaking |
 | Enum or union variant removed | breaking |
+| Enum/error-enum discriminant changed | breaking |
+| Union tuple-case payload types changed | breaking |
+| Union case kind changed (void ↔ tuple) | breaking |
+| Discriminant present on only one side | unknown |
 | UDT kind changed (e.g. struct → enum) | breaking |
 | Event added | non-breaking |
 | Event removed | breaking |
@@ -90,9 +89,27 @@ and, when both specs decode, a spec-level compatibility verdict with these rules
 
 Semantic equivalence is NOT inferred from matching names alone.
 
-Not covered by these rules (see "What this tool does NOT do yet"): union
-tuple-case payload types and UDT enum discriminant values are not decoded, so a
-change confined to those fields yields `identical` rather than `unknown`.
+`unknown` is emitted whenever the decoded specs do not carry enough information
+for a definite verdict (e.g. a discriminant present on only one side). It is
+never downgraded to `non-breaking`.
+
+## JSON schema notes
+
+`spec.types[].cases` is an array of objects (not strings):
+
+```json
+{ "name": "Circle", "kind": "tuple", "payload": ["U32"] }
+{ "name": "A", "kind": "enum", "value": 0 }
+{ "name": "Unit", "kind": "void" }
+```
+
+- `kind`: `"void"` | `"tuple"` | `"enum"` | `"error_enum"`.
+- `payload`: union tuple-case payload types, omitted when empty.
+- `value`: discriminant for enum/error-enum cases, omitted when the spec form
+  carries none (union cases).
+
+`spec.types_changed[].uncertain` is emitted only when true, marking changes that
+forced the overall `unknown` verdict.
 
 ## Output format
 

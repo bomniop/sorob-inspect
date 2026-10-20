@@ -22,8 +22,13 @@
 //! | Struct field renamed | breaking | The field name is part of the encoded struct form |
 //! | Enum variant added | non-breaking | Exhaustive matches may need update but existing code works |
 //! | Enum variant removed | breaking | Existing matches on that variant break |
+//! | Enum discriminant changed | breaking | Wire value changes; stored/encoded data becomes unreadable |
 //! | Union variant added | non-breaking | Same as enum variant added |
 //! | Union variant removed | breaking | Same as enum variant removed |
+//! | Union tuple-case payload changed | breaking | Callers must supply/receive a different type |
+//! | Union case kind changed (void ↔ tuple) | breaking | Shape of the case changes on the wire |
+//! | Discriminant present on only one side | unknown | The decoded specs are not comparable on this field |
+//!
 //! | Event added | non-breaking | New event, existing subscribers unaffected |
 //! | Event removed | breaking | Subscribers lose the event |
 //! | Event param added | breaking | Subscribers expecting old shape break |
@@ -77,6 +82,34 @@ pub struct TypeChange {
     pub kind: String,
     pub detail: String,
     pub breaking: bool,
+    /// True when the decoded specs do not carry enough information to decide
+    /// the verdict for this change (e.g. one side lacks a discriminant). Such
+    /// cases force an overall `unknown` verdict instead of a guessed one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uncertain: bool,
+}
+
+impl TypeChange {
+    fn new(name: &str, kind: &str, detail: impl Into<String>, breaking: bool) -> Self {
+        TypeChange {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            detail: detail.into(),
+            breaking,
+            uncertain: false,
+        }
+    }
+}
+
+/// Build a change that cannot be classified from the spec alone → overall verdict becomes `unknown`.
+fn uncertain_change(name: &str, kind: &str, detail: impl Into<String>) -> TypeChange {
+    TypeChange {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        detail: detail.into(),
+        breaking: false,
+        uncertain: true,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -287,74 +320,121 @@ fn compare_types(old: &SpecType, new: &SpecType) -> Vec<TypeChange> {
 
         for (name, old_ty) in &old_fields {
             match new_fields.get(name) {
-                None => changes.push(TypeChange {
-                    name: old.name.clone(),
-                    kind: old.kind.clone(),
-                    detail: format!("field '{}' removed", name),
-                    breaking: true,
-                }),
+                None => changes.push(TypeChange::new(
+                    &old.name,
+                    &old.kind,
+                    format!("field '{}' removed", name),
+                    true,
+                )),
                 Some(new_ty) => {
                     if old_ty != new_ty {
-                        changes.push(TypeChange {
-                            name: old.name.clone(),
-                            kind: old.kind.clone(),
-                            detail: format!(
-                                "field '{}' type changed: {} -> {}",
-                                name, old_ty, new_ty
-                            ),
-                            breaking: true,
-                        });
+                        changes.push(TypeChange::new(
+                            &old.name,
+                            &old.kind,
+                            format!("field '{}' type changed: {} -> {}", name, old_ty, new_ty),
+                            true,
+                        ));
                     }
                 }
             }
         }
         for name in new_fields.keys() {
             if !old_fields.contains_key(name) {
-                changes.push(TypeChange {
-                    name: old.name.clone(),
-                    kind: old.kind.clone(),
-                    detail: format!("field '{}' added", name),
-                    breaking: true,
-                });
+                changes.push(TypeChange::new(
+                    &old.name,
+                    &old.kind,
+                    format!("field '{}' added", name),
+                    true,
+                ));
             }
         }
     }
 
     // Enum/union/error_enum case comparison.
     if matches!(old.kind.as_str(), "enum" | "union" | "error_enum") && old.kind == new.kind {
-        let old_cases: BTreeMap<&str, ()> = old.cases.iter().map(|c| (c.as_str(), ())).collect();
-        let new_cases: BTreeMap<&str, ()> = new.cases.iter().map(|c| (c.as_str(), ())).collect();
+        let old_cases: BTreeMap<&str, &crate::soroban::SpecCase> =
+            old.cases.iter().map(|c| (c.name.as_str(), c)).collect();
+        let new_cases: BTreeMap<&str, &crate::soroban::SpecCase> =
+            new.cases.iter().map(|c| (c.name.as_str(), c)).collect();
 
-        for name in old_cases.keys() {
-            if !new_cases.contains_key(name) {
-                changes.push(TypeChange {
-                    name: old.name.clone(),
-                    kind: old.kind.clone(),
-                    detail: format!("variant '{}' removed", name),
-                    breaking: true,
-                });
+        for (name, old_c) in &old_cases {
+            match new_cases.get(name) {
+                None => changes.push(TypeChange::new(
+                    &old.name,
+                    &old.kind,
+                    format!("variant '{}' removed", old_c.label()),
+                    true,
+                )),
+                Some(new_c) => {
+                    // A case that survives by name can still change shape:
+                    // payload types on tuple cases, discriminant on enum cases,
+                    // or void <-> tuple kind.
+                    if old_c.kind != new_c.kind {
+                        changes.push(TypeChange::new(
+                            &old.name,
+                            &old.kind,
+                            format!(
+                                "variant '{}' kind changed: {} -> {}",
+                                name, old_c.kind, new_c.kind
+                            ),
+                            true,
+                        ));
+                    }
+                    if old_c.payload != new_c.payload {
+                        changes.push(TypeChange::new(
+                            &old.name,
+                            &old.kind,
+                            format!(
+                                "variant '{}' payload changed: {:?} -> {:?}",
+                                name, old_c.payload, new_c.payload
+                            ),
+                            true,
+                        ));
+                    }
+                    // Discriminants are only comparable when BOTH sides carry
+                    // one. If exactly one side has a value, the spec does not
+                    // tell us enough to decide — that must be `unknown`, never
+                    // a guessed `identical`.
+                    match (old_c.value, new_c.value) {
+                        (Some(o), Some(n)) if o != n => changes.push(TypeChange::new(
+                            &old.name,
+                            &old.kind,
+                            format!("variant '{}' discriminant changed: {} -> {}", name, o, n),
+                            true,
+                        )),
+                        (None, Some(_)) | (Some(_), None) => changes.push(uncertain_change(
+                            &old.name,
+                            &old.kind,
+                            format!(
+                                "variant '{}' discriminant present on only one side: {:?} -> {:?}",
+                                name, old_c.value, new_c.value
+                            ),
+                        )),
+                        _ => {}
+                    }
+                }
             }
         }
-        for name in new_cases.keys() {
+        for (name, new_c) in &new_cases {
             if !old_cases.contains_key(name) {
-                changes.push(TypeChange {
-                    name: old.name.clone(),
-                    kind: old.kind.clone(),
-                    detail: format!("variant '{}' added", name),
-                    breaking: false,
-                });
+                changes.push(TypeChange::new(
+                    &old.name,
+                    &old.kind,
+                    format!("variant '{}' added", new_c.label()),
+                    false,
+                ));
             }
         }
     }
 
     // Kind changed (e.g. struct → enum) — treat as breaking.
     if old.kind != new.kind {
-        changes.push(TypeChange {
-            name: old.name.clone(),
-            kind: old.kind.clone(),
-            detail: format!("type kind changed: {} -> {}", old.kind, new.kind),
-            breaking: true,
-        });
+        changes.push(TypeChange::new(
+            &old.name,
+            &old.kind,
+            format!("type kind changed: {} -> {}", old.kind, new.kind),
+            true,
+        ));
     }
 
     changes
@@ -474,6 +554,11 @@ fn classify(
         return Compatibility::Breaking;
     }
 
+    // Any uncertain change forces an `unknown` verdict — never guess.
+    if types_changed.iter().any(|c| c.uncertain) {
+        return Compatibility::Unknown;
+    }
+
     let has_any_change = !fns_added.is_empty()
         || !types_added.is_empty()
         || !events_added.is_empty()
@@ -545,7 +630,16 @@ mod tests {
             kind: "enum".to_string(),
             name: name.to_string(),
             fields: Vec::new(),
-            cases: cases.into_iter().map(String::from).collect(),
+            cases: cases
+                .into_iter()
+                .enumerate()
+                .map(|(i, n)| crate::soroban::SpecCase {
+                    name: n.to_string(),
+                    kind: "enum".to_string(),
+                    payload: Vec::new(),
+                    value: Some(i as u32),
+                })
+                .collect(),
         }
     }
 
@@ -1016,5 +1110,298 @@ mod tests {
         );
         let d = diff_specs(&a, &b);
         assert_eq!(d.compatibility, Compatibility::Identical);
+    }
+
+    // --- ABI blind-spot regressions: case payload + discriminant ---
+
+    fn union_with_cases(name: &str, cases: Vec<(&str, &str, Vec<&str>)>) -> SpecType {
+        SpecType {
+            kind: "union".to_string(),
+            name: name.to_string(),
+            fields: Vec::new(),
+            cases: cases
+                .into_iter()
+                .map(|(n, kind, payload)| crate::soroban::SpecCase {
+                    name: n.to_string(),
+                    kind: kind.to_string(),
+                    payload: payload.into_iter().map(String::from).collect(),
+                    value: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn tuple_case_payload_type_change_is_breaking() {
+        let a = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Circle", "tuple", vec!["U32"])],
+            )],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Circle", "tuple", vec!["U64"])],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        // The blind spot: identical case names, different payload types.
+        assert_ne!(d.compatibility, Compatibility::Identical);
+        assert_ne!(d.compatibility, Compatibility::NonBreaking);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(d
+            .types_changed
+            .iter()
+            .any(|c| c.detail.contains("payload changed")));
+    }
+
+    #[test]
+    fn tuple_case_payload_arity_change_is_breaking() {
+        let a = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Pair", "tuple", vec!["U32"])],
+            )],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Pair", "tuple", vec!["U32", "U64"])],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(d
+            .types_changed
+            .iter()
+            .any(|c| c.detail.contains("payload changed")));
+    }
+
+    #[test]
+    fn void_to_tuple_case_kind_change_is_breaking() {
+        let a = spec(
+            vec![],
+            vec![union_with_cases("Shape", vec![("Unit", "void", vec![])])],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Unit", "tuple", vec!["U32"])],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(d
+            .types_changed
+            .iter()
+            .any(|c| c.detail.contains("kind changed")));
+    }
+
+    fn enum_with_values(name: &str, cases: Vec<(&str, u32)>) -> SpecType {
+        SpecType {
+            kind: "enum".to_string(),
+            name: name.to_string(),
+            fields: Vec::new(),
+            cases: cases
+                .into_iter()
+                .map(|(n, v)| crate::soroban::SpecCase {
+                    name: n.to_string(),
+                    kind: "enum".to_string(),
+                    payload: Vec::new(),
+                    value: Some(v),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn enum_discriminant_change_is_breaking() {
+        let a = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 0), ("B", 1)])],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 5), ("B", 1)])],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        // Blind spot: same names, different discriminants.
+        assert_ne!(d.compatibility, Compatibility::Identical);
+        assert_ne!(d.compatibility, Compatibility::NonBreaking);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(d
+            .types_changed
+            .iter()
+            .any(|c| c.detail.contains("discriminant changed")));
+    }
+
+    #[test]
+    fn enum_discriminant_reorder_is_breaking() {
+        let a = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 0), ("B", 1)])],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 1), ("B", 0)])],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert_eq!(
+            d.types_changed
+                .iter()
+                .filter(|c| c.detail.contains("discriminant changed"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn identical_case_payload_and_discriminant_is_identical() {
+        let a = spec(
+            vec![],
+            vec![
+                union_with_cases("Shape", vec![("Circle", "tuple", vec!["U32"])]),
+                enum_with_values("Kind", vec![("A", 0), ("B", 1)]),
+            ],
+            vec![],
+        );
+        let b = a_spec_clone();
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Identical);
+    }
+
+    fn a_spec_clone() -> SpecReport {
+        spec(
+            vec![],
+            vec![
+                union_with_cases("Shape", vec![("Circle", "tuple", vec!["U32"])]),
+                enum_with_values("Kind", vec![("A", 0), ("B", 1)]),
+            ],
+            vec![],
+        )
+    }
+
+    #[test]
+    fn union_case_removed_reports_label_without_payload_noise() {
+        let a = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Circle", "tuple", vec!["U32"]), ("Unit", "void", vec![])],
+            )],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Circle", "tuple", vec!["U32"])],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(d
+            .types_changed
+            .iter()
+            .any(|c| c.detail.contains("variant 'Void(Unit)' removed")));
+    }
+
+    #[test]
+    fn enum_case_added_applies_discriminant_without_breaking() {
+        let a = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 0)])],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 0), ("B", 1)])],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::NonBreaking);
+        assert!(d
+            .types_changed
+            .iter()
+            .filter(|c| c.detail.contains("added"))
+            .all(|c| !c.breaking));
+    }
+
+    #[test]
+    fn discriminant_present_on_only_one_side_is_unknown() {
+        // Old side carries a discriminant, new side does not (or vice versa):
+        // the specs are not comparable on this field, so the verdict must be
+        // `unknown` rather than a guessed `identical`/`non-breaking`.
+        let a = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 0)])],
+            vec![],
+        );
+        let mut b_ty = enum_with_values("Kind", vec![("A", 0)]);
+        b_ty.cases[0].value = None;
+        let b = spec(vec![], vec![b_ty], vec![]);
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Unknown);
+        assert!(d.types_changed.iter().any(|c| c.uncertain));
+        assert!(d.types_changed.iter().all(|c| !c.breaking));
+    }
+
+    #[test]
+    fn breaking_outranks_uncertain() {
+        // A definite breaking change is reported even when an uncertain change
+        // is present alongside it.
+        let a = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 0), ("B", 1)])],
+            vec![],
+        );
+        let mut b_ty = enum_with_values("Kind", vec![("A", 9), ("B", 1)]);
+        b_ty.cases[1].value = None;
+        let b = spec(vec![], vec![b_ty], vec![]);
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(d.types_changed.iter().any(|c| c.uncertain));
+    }
+
+    #[test]
+    fn unknown_is_not_reported_as_compatible() {
+        let a = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Circle", "tuple", vec!["U32"])],
+            )],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Circle", "tuple", vec!["U64"])],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_ne!(d.compatibility, Compatibility::Unknown);
+        assert_ne!(d.compatibility, Compatibility::NonBreaking);
+        assert_ne!(d.compatibility, Compatibility::Identical);
     }
 }

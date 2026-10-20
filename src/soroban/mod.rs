@@ -73,9 +73,40 @@ pub struct SpecType {
     /// Fields for structs (name + type), empty for other kinds.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<SpecField>,
-    /// Case names for unions/enums/error enums.
+    /// Cases for unions/enums/error enums, with payload types and discriminants
+    /// preserved as read from the XDR spec.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub cases: Vec<String>,
+    pub cases: Vec<SpecCase>,
+}
+
+/// A single union/enum case.
+///
+/// Payload types (union tuple cases) and discriminant values (enum and error
+/// enum cases) are preserved so that compatibility diffing can see changes to
+/// them. Dropping either field makes a real ABI change invisible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecCase {
+    pub name: String,
+    /// "void" (no payload), "tuple" (payload present), or "enum" (unit variant).
+    pub kind: String,
+    /// Payload types for tuple cases, empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<String>,
+    /// Discriminant value for enum/error-enum cases. `None` when the spec form
+    /// carries no discriminant (union cases), which is not a zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<u32>,
+}
+
+impl SpecCase {
+    /// Compact label used by the human-readable output.
+    pub fn label(&self) -> String {
+        match self.kind.as_str() {
+            "void" => format!("Void({})", self.name),
+            "tuple" => format!("Tuple({})", self.name),
+            _ => self.name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -280,12 +311,23 @@ pub fn decode_spec_raw(raw: &[u8]) -> Result<SpecReport, SorobanError> {
                         .to_vec()
                         .into_iter()
                         .map(|c| match c {
-                            stellar_xdr::ScSpecUdtUnionCaseV0::TupleV0(t) => {
-                                format!("Tuple({})", t.name)
-                            }
-                            stellar_xdr::ScSpecUdtUnionCaseV0::VoidV0(v) => {
-                                format!("Void({})", v.name)
-                            }
+                            stellar_xdr::ScSpecUdtUnionCaseV0::TupleV0(t) => SpecCase {
+                                name: t.name.to_string(),
+                                kind: "tuple".to_string(),
+                                payload: t
+                                    .type_
+                                    .to_vec()
+                                    .into_iter()
+                                    .map(|x| format_type_def(&x))
+                                    .collect(),
+                                value: None,
+                            },
+                            stellar_xdr::ScSpecUdtUnionCaseV0::VoidV0(v) => SpecCase {
+                                name: v.name.to_string(),
+                                kind: "void".to_string(),
+                                payload: Vec::new(),
+                                value: None,
+                            },
                         })
                         .collect(),
                 }),
@@ -297,7 +339,12 @@ pub fn decode_spec_raw(raw: &[u8]) -> Result<SpecReport, SorobanError> {
                         .cases
                         .to_vec()
                         .into_iter()
-                        .map(|c| c.name.to_string())
+                        .map(|c| SpecCase {
+                            name: c.name.to_string(),
+                            kind: "enum".to_string(),
+                            payload: Vec::new(),
+                            value: Some(c.value),
+                        })
                         .collect(),
                 }),
                 ScSpecEntry::UdtErrorEnumV0(e) => types.push(SpecType {
@@ -308,7 +355,12 @@ pub fn decode_spec_raw(raw: &[u8]) -> Result<SpecReport, SorobanError> {
                         .cases
                         .to_vec()
                         .into_iter()
-                        .map(|c| c.name.to_string())
+                        .map(|c| SpecCase {
+                            name: c.name.to_string(),
+                            kind: "error_enum".to_string(),
+                            payload: Vec::new(),
+                            value: Some(c.value),
+                        })
                         .collect(),
                 }),
                 ScSpecEntry::EventV0(ev) => events.push(SpecEvent {
