@@ -269,6 +269,8 @@ fn compare_functions(old: &SpecFunction, new: &SpecFunction) -> Vec<FunctionChan
 
     for (oi, ni) in old.inputs.iter().zip(new.inputs.iter()) {
         if oi.type_ != ni.type_ {
+            // Report every changed parameter, not just the first: a caller
+            // fixing one type mismatch must also see the others.
             changes.push(FunctionChange {
                 name: old.name.clone(),
                 detail: format!(
@@ -277,9 +279,7 @@ fn compare_functions(old: &SpecFunction, new: &SpecFunction) -> Vec<FunctionChan
                 ),
                 breaking: true,
             });
-            break; // one type change per function is enough to flag
-        }
-        if oi.name != ni.name {
+        } else if oi.name != ni.name {
             changes.push(FunctionChange {
                 name: old.name.clone(),
                 detail: format!("param renamed: {} -> {}", oi.name, ni.name),
@@ -735,6 +735,87 @@ mod tests {
     }
 
     #[test]
+    fn multiple_param_type_changes_are_all_reported() {
+        // Previously the loop `break`ed after the first type change, so a second
+        // broken parameter was invisible to the caller.
+        let a = spec(
+            vec![fn_spec(
+                "transfer",
+                vec![("from", "Address"), ("to", "Address"), ("amount", "I128")],
+                vec![],
+            )],
+            vec![],
+            vec![],
+        );
+        let b = spec(
+            vec![fn_spec(
+                "transfer",
+                vec![("from", "Address"), ("to", "U64"), ("amount", "U64")],
+                vec![],
+            )],
+            vec![],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        let type_changes: Vec<&FunctionChange> = d
+            .functions_changed
+            .iter()
+            .filter(|c| c.detail.starts_with("param type changed"))
+            .collect();
+        assert_eq!(
+            type_changes.len(),
+            2,
+            "both parameter type changes must be reported: {:?}",
+            d.functions_changed
+        );
+        assert!(type_changes.iter().all(|c| c.breaking));
+        assert!(
+            type_changes
+                .iter()
+                .any(|c| c.detail.contains("to Address -> to U64")),
+            "second parameter change must be present: {:?}",
+            d.functions_changed
+        );
+        assert!(
+            type_changes
+                .iter()
+                .any(|c| c.detail.contains("amount I128 -> amount U64")),
+            "third parameter change must be present: {:?}",
+            d.functions_changed
+        );
+    }
+
+    #[test]
+    fn param_with_type_and_name_change_reports_once() {
+        // When a param changes both name and type it must surface as a single
+        // breaking type-change entry (the `else if` prevents a redundant
+        // non-breaking rename entry for the same parameter).
+        let a = spec(
+            vec![fn_spec("f", vec![("a", "U32")], vec![])],
+            vec![],
+            vec![],
+        );
+        let b = spec(
+            vec![fn_spec("f", vec![("b", "U64")], vec![])],
+            vec![],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert_eq!(
+            d.functions_changed.len(),
+            1,
+            "a single param changing name+type must produce exactly one change"
+        );
+        assert_eq!(
+            d.functions_changed[0].detail,
+            "param type changed: a U32 -> b U64"
+        );
+        assert!(d.functions_changed[0].breaking);
+    }
+
+    #[test]
     fn param_count_change_is_breaking() {
         let a = spec(
             vec![fn_spec("f", vec![("a", "U32")], vec![])],
@@ -795,6 +876,70 @@ mod tests {
     }
 
     // --- UDT field changes ---
+
+    #[test]
+    fn multiple_struct_field_type_changes_are_all_reported() {
+        // Every changed struct field must be reported, not just the first.
+        let a = spec(
+            vec![],
+            vec![struct_with_fields(
+                "Config",
+                vec![("owner", "Address"), ("fee", "U32"), ("active", "Bool")],
+            )],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![struct_with_fields(
+                "Config",
+                vec![("owner", "Address"), ("fee", "U64"), ("active", "I32")],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        let field_changes: Vec<&TypeChange> = d
+            .types_changed
+            .iter()
+            .filter(|c| c.detail.contains("type changed"))
+            .collect();
+        assert_eq!(
+            field_changes.len(),
+            2,
+            "both struct field type changes must be reported: {:?}",
+            d.types_changed
+        );
+        assert!(field_changes.iter().all(|c| c.breaking));
+        assert!(
+            field_changes
+                .iter()
+                .any(|c| c.detail.contains("field 'fee' type changed: U32 -> U64")),
+            "second field change missing: {:?}",
+            d.types_changed
+        );
+        assert!(
+            field_changes.iter().any(|c| c
+                .detail
+                .contains("field 'active' type changed: Bool -> I32")),
+            "third field change missing: {:?}",
+            d.types_changed
+        );
+    }
+
+    #[test]
+    fn unchanged_struct_fields_produce_no_changes() {
+        // Identical structs must not produce any type change entries.
+        let mk = || struct_with_fields("Config", vec![("owner", "Address"), ("fee", "U32")]);
+        let d = diff_specs(
+            &spec(vec![], vec![mk()], vec![]),
+            &spec(vec![], vec![mk()], vec![]),
+        );
+        assert!(
+            d.types_changed.is_empty(),
+            "identical struct fields must not report changes: {:?}",
+            d.types_changed
+        );
+    }
 
     #[test]
     fn struct_field_added_is_breaking() {
@@ -945,6 +1090,88 @@ mod tests {
         assert_eq!(d.compatibility, Compatibility::Breaking);
         assert_eq!(d.events_changed.len(), 1);
         assert!(d.events_changed[0].breaking);
+    }
+
+    #[test]
+    fn multiple_event_param_type_changes_are_all_reported() {
+        // Each mismatched event param must surface as its own breaking change,
+        // with param count and data_format held constant.
+        let a = spec(
+            vec![],
+            vec![],
+            vec![event(
+                "Transfer",
+                vec![],
+                vec![
+                    ("from", "Address", "data"),
+                    ("to", "Address", "data"),
+                    ("amount", "I128", "data"),
+                ],
+            )],
+        );
+        let b = spec(
+            vec![],
+            vec![],
+            vec![event(
+                "Transfer",
+                vec![],
+                vec![
+                    ("from", "Address", "data"),
+                    ("to", "U64", "data"),
+                    ("amount", "U64", "data"),
+                ],
+            )],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        let type_changes: Vec<&EventChange> = d
+            .events_changed
+            .iter()
+            .filter(|c| c.detail.contains("type changed"))
+            .collect();
+        assert_eq!(
+            type_changes.len(),
+            2,
+            "both event param type changes must be reported: {:?}",
+            d.events_changed
+        );
+        assert!(type_changes.iter().all(|c| c.breaking));
+        assert!(
+            type_changes
+                .iter()
+                .any(|c| c.detail.contains("param 'to' type changed: Address -> U64")),
+            "second param change missing: {:?}",
+            d.events_changed
+        );
+        assert!(
+            type_changes.iter().any(|c| c
+                .detail
+                .contains("param 'amount' type changed: I128 -> U64")),
+            "third param change missing: {:?}",
+            d.events_changed
+        );
+    }
+
+    #[test]
+    fn unchanged_event_params_produce_no_changes() {
+        // Identical event params (same names, types, locations, count) must not
+        // produce any event change entries.
+        let mk = || {
+            event(
+                "Transfer",
+                vec!["transfer"],
+                vec![("from", "Address", "topic"), ("to", "Address", "data")],
+            )
+        };
+        let d = diff_specs(
+            &spec(vec![], vec![], vec![mk()]),
+            &spec(vec![], vec![], vec![mk()]),
+        );
+        assert!(
+            d.events_changed.is_empty(),
+            "identical event params must not report changes: {:?}",
+            d.events_changed
+        );
     }
 
     #[test]
@@ -1129,6 +1356,125 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn multiple_variant_payload_changes_are_all_reported() {
+        // Two surviving variants both changing payload type must each produce
+        // their own breaking change entry.
+        let a = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![
+                    ("Circle", "tuple", vec!["U32"]),
+                    ("Rect", "tuple", vec!["U32", "U32"]),
+                ],
+            )],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![
+                    ("Circle", "tuple", vec!["U64"]),
+                    ("Rect", "tuple", vec!["U64", "U64"]),
+                ],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        let payload_changes: Vec<&TypeChange> = d
+            .types_changed
+            .iter()
+            .filter(|c| c.detail.contains("payload changed"))
+            .collect();
+        assert_eq!(
+            payload_changes.len(),
+            2,
+            "both variant payload changes must be reported: {:?}",
+            d.types_changed
+        );
+        assert!(payload_changes.iter().all(|c| c.breaking));
+        assert!(
+            payload_changes
+                .iter()
+                .any(|c| c.detail.contains("variant 'Circle' payload changed")),
+            "first variant payload change missing: {:?}",
+            d.types_changed
+        );
+        assert!(
+            payload_changes
+                .iter()
+                .any(|c| c.detail.contains("variant 'Rect' payload changed")),
+            "second variant payload change missing: {:?}",
+            d.types_changed
+        );
+    }
+
+    #[test]
+    fn union_case_void_to_tuple_kind_change_is_breaking() {
+        // A surviving case whose shape changes void -> tuple must be reported
+        // as breaking.
+        let a = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Unit", "void", vec![]), ("Circle", "tuple", vec!["U32"])],
+            )],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![
+                    ("Unit", "tuple", vec!["U32"]),
+                    ("Circle", "tuple", vec!["U32"]),
+                ],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Breaking);
+        assert!(
+            d.types_changed.iter().any(|c| c
+                .detail
+                .contains("variant 'Unit' kind changed: void -> tuple")),
+            "void -> tuple kind change must be reported: {:?}",
+            d.types_changed
+        );
+    }
+
+    #[test]
+    fn union_variant_added_is_non_breaking() {
+        // Adding a union variant is non-breaking under the documented policy:
+        // existing code matching the old variants keeps working.
+        let a = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![("Circle", "tuple", vec!["U32"])],
+            )],
+            vec![],
+        );
+        let b = spec(
+            vec![],
+            vec![union_with_cases(
+                "Shape",
+                vec![
+                    ("Circle", "tuple", vec!["U32"]),
+                    ("Rect", "tuple", vec!["U32", "U32"]),
+                ],
+            )],
+            vec![],
+        );
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::NonBreaking);
+        assert_eq!(d.types_changed.len(), 1);
+        assert!(!d.types_changed[0].breaking);
     }
 
     #[test]
@@ -1362,6 +1708,25 @@ mod tests {
         assert_eq!(d.compatibility, Compatibility::Unknown);
         assert!(d.types_changed.iter().any(|c| c.uncertain));
         assert!(d.types_changed.iter().all(|c| !c.breaking));
+    }
+
+    #[test]
+    fn uncertain_outranks_non_breaking_addition() {
+        // A mixed spec — an uncertain discriminant change plus a non-breaking
+        // addition — must yield `unknown`, never `non-breaking`. Precedence:
+        // Breaking > Unknown > NonBreaking > Identical.
+        let a = spec(
+            vec![],
+            vec![enum_with_values("Kind", vec![("A", 0)])],
+            vec![],
+        );
+        let mut b_ty = enum_with_values("Kind", vec![("A", 0)]);
+        b_ty.cases[0].value = None;
+        let b = spec(vec![], vec![b_ty, udt("Extra", "struct")], vec![]);
+        let d = diff_specs(&a, &b);
+        assert_eq!(d.compatibility, Compatibility::Unknown);
+        assert!(d.types_changed.iter().any(|c| c.uncertain));
+        assert_eq!(d.types_added, vec!["Extra"]);
     }
 
     #[test]
