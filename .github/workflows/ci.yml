@@ -41,6 +41,18 @@ jobs:
       - name: cargo clippy --all-targets --all-features -- -D warnings
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # Verifies the crate still builds with the declared MSRV (rust-version =
+  # 1.85 in Cargo.toml). Uses the committed lockfile. Catches accidental
+  # MSRV bumps from new dependencies or language features.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: cargo check --locked
+        run: cargo check --locked
+
   # Verifies committed fixtures still decode correctly against the pinned
   # stellar-xdr version. Full contract rebuild requires stellar-cli 28.1.0
   # (too heavy for CI); fixture provenance + reproduction steps are in

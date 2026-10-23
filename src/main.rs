@@ -3,7 +3,10 @@
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use sorob_inspect::soroban::inspect_soroban;
-use sorob_inspect::wasm::{inspect, WasmReport};
+use sorob_inspect::wasm::{
+    analyze, inspect, DataSegmentMode, ElementExpr, ElementItem, ElementKind, ElementRefResolution,
+    ElementSegmentMode, OffsetExpr, WasmReport,
+};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,8 +46,8 @@ enum Command {
     },
     /// Structural diff between two WASM artifacts.
     ///
-    /// Reports added/removed imports and exports, plus a spec-level
-    /// compatibility verdict when both contract specs decode.
+    /// Reports added/removed imports, exports, and custom sections, plus a
+    /// spec-level compatibility verdict when both contract specs decode.
     Diff {
         /// Old/baseline .wasm file
         old: PathBuf,
@@ -80,7 +83,12 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Inspect { file, json } => {
             let bytes = read_wasm(&file)?;
-            let report = inspect(&bytes, false).map_err(|e| e.to_string())?;
+            let mut report = inspect(&bytes, false).map_err(|e| e.to_string())?;
+            report.analysis = Some(analyze(&bytes).map_err(|e| e.to_string())?);
+            // Refresh the consolidated summary so `analysis_finding_count`
+            // reflects the analysis that was just attached.
+            report.summary =
+                sorob_inspect::wasm::build_analysis_summary(&report).map_err(|e| e.to_string())?;
             if json {
                 print_json(&report)?;
             } else {
@@ -101,6 +109,32 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!("spec functions: {}", spec.functions.len());
                     println!("spec types: {}", spec.types.len());
                     println!("spec events: {}", spec.events.len());
+                }
+                if let Some(c) = &report.consistency {
+                    println!("--- spec/export consistency ---");
+                    println!("  status: {}", c.status);
+                    if let Some(r) = &c.reason {
+                        println!("  reason: {r}");
+                    }
+                    println!(
+                        "  spec functions: {}, wasm function exports: {}",
+                        c.spec_function_count, c.wasm_function_export_count
+                    );
+                    for f in &c.findings {
+                        println!(
+                            "  [{}] {}: {} (evidence: {})",
+                            f.severity, f.code, f.message, f.evidence
+                        );
+                    }
+                    if !c.unmatched_exports.is_empty() {
+                        println!(
+                            "  exports not named by spec (informational): {}",
+                            c.unmatched_exports.join(", ")
+                        );
+                    }
+                    if !c.not_checked.is_empty() {
+                        println!("  not checked: {}", c.not_checked.join(", "));
+                    }
                 }
                 println!("summary: {}", report.summary);
                 println!();
@@ -132,6 +166,7 @@ fn run(cli: Cli) -> Result<(), String> {
 
             if json {
                 print_json(&serde_json::json!({
+                    "schema_version": 1,
                     "structural": diff,
                     "spec": spec_diff,
                 }))?;
@@ -223,20 +258,380 @@ fn print_wasm_report(path: &Path, report: &WasmReport) {
     println!("size: {} bytes", report.size_bytes);
     println!("imports: {}", report.imports.len());
     for i in &report.imports {
-        match &i.type_sig {
-            Some(sig) => println!("  {}::{} [{}] {sig}", i.module, i.name, i.kind),
+        let detail = match (&i.type_sig, &i.memory, &i.table, &i.global) {
+            (Some(sig), ..) => Some(format!("type {} {sig}", i.type_index.unwrap_or(0))),
+            (None, Some(m), ..) => Some(match m.max_pages {
+                Some(max) => format!(
+                    "min {} pages (max {max}){}",
+                    m.min_pages,
+                    if m.is64 { " 64-bit" } else { "" }
+                ),
+                None => format!(
+                    "min {} pages{}",
+                    m.min_pages,
+                    if m.is64 { " 64-bit" } else { "" }
+                ),
+            }),
+            (None, None, Some(t), _) => Some(match t.max_size {
+                Some(max) => format!("{} min {} max {}", t.element_type, t.min_size, max),
+                None => format!("{} min {}", t.element_type, t.min_size),
+            }),
+            (None, None, None, Some(g)) => Some(format!(
+                "{} {}",
+                g.value_type,
+                if g.mutable {
+                    "(mutable)"
+                } else {
+                    "(immutable)"
+                }
+            )),
+            _ => None,
+        };
+        match detail {
+            Some(d) => println!("  {}::{} [{}] {d}", i.module, i.name, i.kind),
             None => println!("  {}::{} [{}]", i.module, i.name, i.kind),
         }
     }
     println!("exports: {}", report.exports.len());
     for e in &report.exports {
-        println!("  {} [{}] idx={}", e.name, e.kind, e.index);
+        let detail = match (&e.type_sig, &e.memory, &e.table, &e.global) {
+            (Some(sig), ..) => format!("type {} {sig}", e.type_index.unwrap_or(0)),
+            (None, Some(m), ..) => match m.max_pages {
+                Some(max) => format!(
+                    "min {} pages (max {max}){}",
+                    m.min_pages,
+                    if m.is64 { " 64-bit" } else { "" }
+                ),
+                None => format!(
+                    "min {} pages{}",
+                    m.min_pages,
+                    if m.is64 { " 64-bit" } else { "" }
+                ),
+            },
+            (None, None, Some(t), _) => match t.max_size {
+                Some(max) => format!("{} min {} max {}", t.element_type, t.min_size, max),
+                None => format!("{} min {}", t.element_type, t.min_size),
+            },
+            (None, None, None, Some(g)) => format!(
+                "{} {}",
+                g.value_type,
+                if g.mutable {
+                    "(mutable)"
+                } else {
+                    "(immutable)"
+                }
+            ),
+            _ => String::new(),
+        };
+        if detail.is_empty() {
+            println!("  {} [{}] idx={}", e.name, e.kind, e.index);
+        } else {
+            println!("  {} [{}] idx={} {detail}", e.name, e.kind, e.index);
+        }
     }
     println!("custom sections: {}", report.custom_sections.len());
     for s in &report.custom_sections {
         println!("  {} ({} bytes)", s.name, s.len_bytes);
     }
     println!("defined functions: {}", report.functions.len());
+    if let Some(s) = &report.structure {
+        println!("--- module structure ---");
+        if !s.memories.is_empty() {
+            for (i, m) in s.memories.iter().enumerate() {
+                match m.max_pages {
+                    Some(max) => println!(
+                        "  memory[{i}]: {}{} pages (max {max})",
+                        m.min_pages,
+                        if m.is64 { " (64-bit)" } else { "" }
+                    ),
+                    None => println!(
+                        "  memory[{i}]: min {} pages{}",
+                        m.min_pages,
+                        if m.is64 { " (64-bit)" } else { "" }
+                    ),
+                }
+            }
+        }
+        if !s.tables.is_empty() {
+            for (i, t) in s.tables.iter().enumerate() {
+                match t.max_size {
+                    Some(max) => println!(
+                        "  table[{i}]: {} min {} max {}",
+                        t.element_type, t.min_size, max
+                    ),
+                    None => println!("  table[{i}]: {} min {}", t.element_type, t.min_size),
+                }
+            }
+        }
+        if !s.globals.is_empty() {
+            for (i, g) in s.globals.iter().enumerate() {
+                println!(
+                    "  global[{i}]: {} {}",
+                    g.value_type,
+                    if g.mutable {
+                        "(mutable)"
+                    } else {
+                        "(immutable)"
+                    }
+                );
+            }
+        }
+        if s.data_segments > 0 {
+            println!("  data segments: {}", s.data_segments);
+            for seg in &s.data_segment_details {
+                match seg.mode {
+                    DataSegmentMode::Active => {
+                        let mem = seg.memory_index.unwrap_or(0);
+                        let off = match &seg.offset {
+                            Some(OffsetExpr::Const { value }) => value.to_string(),
+                            Some(OffsetExpr::GlobalGet { global_index }) => {
+                                format!("global.get {global_index}")
+                            }
+                            Some(OffsetExpr::Unsupported { reason }) => {
+                                format!("unsupported ({reason})")
+                            }
+                            None => "?".to_string(),
+                        };
+                        println!(
+                            "    [{index}] active mem={mem} offset={off} payload={len}B",
+                            index = seg.index,
+                            len = seg.payload_len
+                        );
+                    }
+                    DataSegmentMode::Passive => {
+                        println!(
+                            "    [{index}] passive payload={len}B",
+                            index = seg.index,
+                            len = seg.payload_len
+                        );
+                    }
+                }
+            }
+        }
+        if s.element_segments > 0 {
+            println!("  element segments: {}", s.element_segments);
+            for seg in &s.element_segment_details {
+                let mode = match seg.mode {
+                    ElementSegmentMode::Active => "active",
+                    ElementSegmentMode::Passive => "passive",
+                    ElementSegmentMode::Declared => "declared",
+                };
+                let mut line = format!("    [{index}] {mode}", index = seg.index);
+                if let Some(t) = seg.table_index {
+                    line.push_str(&format!(" table={t}"));
+                }
+                if let Some(offset) = &seg.offset {
+                    let off = match offset {
+                        OffsetExpr::Const { value } => value.to_string(),
+                        OffsetExpr::GlobalGet { global_index } => {
+                            format!("global.get {global_index}")
+                        }
+                        OffsetExpr::Unsupported { reason } => {
+                            format!("unsupported ({reason})")
+                        }
+                    };
+                    line.push_str(&format!(" offset={off}"));
+                }
+                match &seg.kind {
+                    ElementKind::Functions => {
+                        line.push_str(&format!(" funcs count={}", seg.element_count));
+                    }
+                    ElementKind::Expressions { element_type } => {
+                        line.push_str(&format!(
+                            " exprs type={element_type} count={}",
+                            seg.element_count
+                        ));
+                    }
+                }
+                println!("{line}");
+                for item in &seg.items {
+                    match item {
+                        ElementItem::FuncIndex(f) => {
+                            let res = match &f.resolution {
+                                ElementRefResolution::Imported { module, name } => {
+                                    format!("imported {module}::{name}")
+                                }
+                                ElementRefResolution::Defined {
+                                    declared_index,
+                                    signature,
+                                } => format!("defined[{declared_index}] {signature}"),
+                                ElementRefResolution::Invalid => "invalid".to_string(),
+                            };
+                            println!(
+                                "      item[{}] func idx={} -> {res}",
+                                f.item_index, f.raw_index
+                            );
+                        }
+                        ElementItem::Expr(e) => {
+                            let res = match &e.expr {
+                                ElementExpr::RefFunc {
+                                    raw_index,
+                                    resolution,
+                                } => {
+                                    let r = match resolution {
+                                        ElementRefResolution::Imported { module, name } => {
+                                            format!("imported {module}::{name}")
+                                        }
+                                        ElementRefResolution::Defined {
+                                            declared_index,
+                                            signature,
+                                        } => format!("defined[{declared_index}] {signature}"),
+                                        ElementRefResolution::Invalid => "invalid".to_string(),
+                                    };
+                                    format!("ref.func {raw_index} -> {r}")
+                                }
+                                ElementExpr::RefNull { heap_type } => {
+                                    format!("ref.null {heap_type}")
+                                }
+                                ElementExpr::Unsupported { reason } => {
+                                    format!("unsupported ({reason})")
+                                }
+                            };
+                            println!(
+                                "      item[{}] expr type={} {res}",
+                                e.item_index, e.element_type
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(f) = s.start_func {
+            println!("  start function: {f}");
+        }
+        if let Some(sf) = &s.start_function {
+            match sf.resolution.as_str() {
+                "imported" => match &sf.import {
+                    Some(i) => {
+                        println!("    resolves to imported function {}::{}", i.module, i.name)
+                    }
+                    None => println!("    resolves to imported function"),
+                },
+                "defined" => match &sf.function {
+                    Some(f) => println!(
+                        "    resolves to defined function[{}] {}",
+                        f.declared_index, f.signature
+                    ),
+                    None => println!("    resolves to defined function"),
+                },
+                other => println!("    index {other} does not resolve to a function"),
+            }
+        }
+    }
+    if let Some(a) = &report.analysis {
+        println!("--- resource analysis ---");
+        if !a.imported_memories.is_empty() {
+            println!("  imported memories: {}", a.imported_memories.join(", "));
+        }
+        if !a.defined_memories.is_empty() {
+            for (i, m) in a.defined_memories.iter().enumerate() {
+                match m.max_pages {
+                    Some(max) => println!(
+                        "  defined memory[{i}]: {}{} pages (max {max})",
+                        m.min_pages,
+                        if m.is64 { " (64-bit)" } else { "" }
+                    ),
+                    None => println!(
+                        "  defined memory[{i}]: min {} pages{}",
+                        m.min_pages,
+                        if m.is64 { " (64-bit)" } else { "" }
+                    ),
+                }
+            }
+        }
+        if !a.imported_tables.is_empty() {
+            println!("  imported tables: {}", a.imported_tables.join(", "));
+        }
+        if !a.defined_tables.is_empty() {
+            for (i, t) in a.defined_tables.iter().enumerate() {
+                match t.max_size {
+                    Some(max) => println!(
+                        "  defined table[{i}]: {} min {} max {}",
+                        t.element_type, t.min_size, max
+                    ),
+                    None => println!(
+                        "  defined table[{i}]: {} min {}",
+                        t.element_type, t.min_size
+                    ),
+                }
+            }
+        }
+        if !a.imported_globals.is_empty() {
+            println!("  imported globals: {}", a.imported_globals.join(", "));
+        }
+        if !a.defined_globals.is_empty() {
+            for (i, g) in a.defined_globals.iter().enumerate() {
+                println!(
+                    "  defined global[{i}]: {} {}",
+                    g.value_type,
+                    if g.mutable {
+                        "(mutable)"
+                    } else {
+                        "(immutable)"
+                    }
+                );
+            }
+        }
+        println!("  functions: {}", a.function_count);
+        println!("  data segments: {}", a.data_segment_count);
+        println!("  element segments: {}", a.element_segment_count);
+        if !a.findings.is_empty() {
+            println!("--- compatibility findings ---");
+            for f in &a.findings {
+                println!("  [{}] {}: {}", f.severity, f.code, f.message);
+            }
+        }
+        println!("--- coverage ---");
+        println!("  checked: {}", a.coverage.checked.join(", "));
+        println!("  not checked: {}", a.coverage.not_checked.join(", "));
+    }
+    if let Some(i) = &report.interface {
+        println!("--- interface ---");
+        if !i.imports_by_kind.is_empty() {
+            println!(
+                "  imports: {}",
+                i.imports_by_kind
+                    .iter()
+                    .map(|k| format!("{} {}", k.count, k.kind))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !i.exports_by_kind.is_empty() {
+            println!(
+                "  exports: {}",
+                i.exports_by_kind
+                    .iter()
+                    .map(|k| format!("{} {}", k.count, k.kind))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !i.exported_functions.is_empty() {
+            for f in &i.exported_functions {
+                match &f.signature {
+                    Some(sig) => println!("  fn {} idx={} {sig}", f.name, f.index),
+                    None => println!("  fn {} idx={} (signature unavailable)", f.name, f.index),
+                }
+            }
+        }
+        if !i.imported_functions.is_empty() {
+            for f in &i.imported_functions {
+                match &f.signature {
+                    Some(sig) => println!("  import {}::{} {sig}", f.module, f.name),
+                    None => println!("  import {}::{} (signature unavailable)", f.module, f.name),
+                }
+            }
+        }
+        println!(
+            "  contract spec: {}",
+            if i.has_contract_spec {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+    }
 }
 
 #[derive(Debug, Serialize)]

@@ -2,7 +2,7 @@
 name = "sorob-inspect"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 description = "Inspect Soroban WASM artifacts: structure, imports/exports, custom sections, and contract-spec validation"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bomniop/sorob-inspect"

@@ -4,7 +4,7 @@ Inspect, validate, and diff Soroban WASM artifacts from the command line.
 
 ## What this tool does today
 
-- `inspect` — parse a `.wasm` file and report imports (with structured function/memory/table/global details), exports, custom sections, defined function signatures, a module-structure summary (memory limits, table bounds, global types, data/element segment counts, start function), and a resource + compatibility analysis (imported vs defined resources, function/segment counts, and Soroban compatibility findings).
+- `inspect` — parse a `.wasm` file and report imports (with structured function/memory/table/global details), exports, custom sections, defined function signatures, a module-structure summary (memory limits, table bounds, global types, data/element segment counts, start function), a per-function code-body metrics block (body size, locals, operator count, instruction inventory, control nesting), the static direct-call graph, defined-function reachability, and a consolidated summary rollup of those counts.
 - `validate` — run generic WASM validation, detect Soroban contract markers (`contractspecv0`, `contractenvmetav0`), and decode the contract spec into structured data (functions, params, return types, UDTs, events) via `stellar-xdr`.
 - `diff` — structural diff (imports/exports/custom sections) plus spec-level compatibility diff when both sides decode successfully.
 
@@ -435,7 +435,169 @@ Changing an event's `data_format` between any of these is reported as breaking
   the inventory. The array is omitted when the module has no defined functions.
   These are static structural counts — they are not gas estimates,
   execution-time proxies, complexity scores, or security signals.
+
+- Direct call edges are reported per defined function in `direct_calls`, plus
+  indirect/reference call-site counters. Example:
+
+```json
+"code_body_metrics": [
+  {
+    "defined_index": 0,
+    "function_index": 2,
+    "operator_count": 3,
+    "direct_calls": [
+      { "callee_index": 0, "call_count": 1,
+        "resolution": { "kind": "imported", "module": "env", "name": "put" } },
+      { "callee_index": 3, "call_count": 2,
+        "resolution": { "kind": "defined", "defined_index": 1 } }
+    ],
+    "indirect_call_sites": 1
+  }
+]
+```
+
+  `direct_calls` has one entry per *distinct* callee, sorted by callee index,
+  with `call_count` aggregating repeated call sites to the same target.
+  `resolution` is one of:
+
+  | kind | meaning |
+  |---|---|
+  | `imported` | callee is a function import; carries `module` and `name` |
+  | `defined` | callee is a locally defined function; carries `defined_index` |
+  | `invalid` | the callee index names no function in the index space |
+
+  `call_indirect` / `return_call_indirect` sites are counted in
+  `indirect_call_sites`; `call_ref` / `return_call_ref` sites in
+  `reference_call_sites`. Neither produces an edge — the callee is a runtime
+  value or a type, not a static index, so no target is invented. Both counters
+  are omitted when zero, as is `direct_calls` when empty.
+
+- Structural complexity metrics are reported per defined function alongside the
+  fields above. All are derived from the same operator traversal as
+  `operator_count`, so they stay consistent with it:
+
+  | field | exact definition |
+  |---|---|
+  | `basic_block_count` | Number of *syntactic* basic blocks. A block starts at each "leader": the body's first operator, the operator after each `block` / `loop` / `if`, each `else`, each `end`, and the operator after each `br` / `br_if` / `br_table` / `return` / `unreachable`. `call` and its variants are not boundaries. Branch targets are not resolved to instructions, so this is a syntactic count, not a control-flow-graph block count. |
+  | `conditional_branch_count` | `br_if` sites plus `if` constructs. Each is a two-way decision. |
+  | `unconditional_branch_count` | `br`, `br_table`, `return`, and `unreachable` sites — each transfers control unconditionally. |
+  | `loop_count` | `loop` constructs. |
+  | `if_count` | `if` constructs (a subset of `conditional_branch_count`; the rest is `br_if`). |
+  | `max_control_depth` | Reused unchanged: maximum nesting depth of `block` / `loop` / `if`. |
+  | `direct_call_site_count` | `call` + `return_call` occurrences, counting repeats. Distinct from `direct_calls.len()` (distinct callees). |
+  | `cyclomatic_complexity` | `1 + if_count + br_if_count + br_table_count`. |
+
+  The cyclomatic figure is an **estimate**, not a control-flow-graph
+  computation: each `br_table` counts as a single decision point regardless of
+  how many targets it names, and `br` / `return` / `unreachable` are not
+  decision points.
+
+  These metrics describe the shape of the code as written. They are **not**
+  measures of execution cost, runtime performance, security, or exploitability,
+  and they do not account for what a call actually does at runtime.
+
+- Static reachability is reported in `reachability` when the module defines at
+  least one function. Example:
+
+```json
+"reachability": {
+  "roots": [
+    { "kind": "export", "name": "entry", "function_index": 0,
+      "resolution": "defined", "defined_index": 0 }
+  ],
+  "reachable_defined": [0, 1, 2],
+  "unreachable_defined": [3]
+}
+```
+
+  **Root selection** is deliberately conservative — only two kinds:
+
+  | kind | when it is a root |
+  |---|---|
+  | `start` | the WASM start section is present and its index is valid |
+  | `export` | an export whose `kind` is `function` |
+
+  No root is invented for runtime callbacks, indirect calls, reference calls,
+  host invocation, or framework-specific entry points.
+
+  `roots` is ordered with the start function first, then exports by function
+  index. Each root carries its `resolution`: `defined` (with `defined_index`),
+  `imported` (no defined index — imported functions have no body in this
+  module and are not traversed), or `invalid` (no function at that index).
+
+  Traversal follows direct `call` / `return_call` edges only, breadth-first,
+  using the already-decoded `direct_calls` graph — the module is never
+  reparsed. `reachable_defined` and `unreachable_defined` are sorted by
+  defined index; empty lists are omitted.
+
+  **"Unreachable" means only "not reached from the selected static roots."**
+  It is not a dead-code judgement and not a safe-to-remove signal. A function
+  reached at runtime through `call_indirect`, `call_ref`, host invocation, or a
+  framework's own entry points will legitimately appear unreachable here.
 - Every error path prints to stderr and exits with a non-zero status.
+
+### Consolidated summary
+
+`inspect` emits a top-level `summary` object — a deterministic, additive rollup
+of facts already computed above. It never reparses the module and adds no new
+analysis; its job is to let a consumer read the headline counts without walking
+the underlying arrays.
+
+```json
+{
+  "summary": {
+    "custom_section_count": 1,
+    "imported_function_count": 0,
+    "exported_function_count": 1,
+    "defined_function_count": 2,
+    "total_function_count": 2,
+    "total_body_bytes": 9,
+    "total_operator_count": 3,
+    "total_local_count": 0,
+    "instruction_family_totals": { "control": 2, "misc": 1 },
+    "has_contract_spec": true,
+    "structure": {
+      "memory_count": 1,
+      "table_count": 0,
+      "global_count": 0,
+      "data_segment_count": 0,
+      "element_segment_count": 0,
+      "has_start_function": false
+    },
+    "reachability": {
+      "root_count": 1,
+      "reachable_defined_count": 2,
+      "unreachable_defined_count": 0
+    },
+    "analysis_finding_count": 0
+  }
+}
+```
+
+Field semantics:
+
+- `custom_section_count` — mirrors `custom_sections.len()`.
+- `imported_function_count` — `imports` entries whose `kind` is `"function"`.
+- `exported_function_count` — `exports` entries whose `kind` is `"function"`.
+- `defined_function_count` — mirrors `code_body_metrics.len()`.
+- `total_function_count` — `imported_function_count + defined_function_count`;
+  the size of the module's function index space.
+- `total_body_bytes` — sum of `code_body_metrics[].body_len_bytes`.
+- `total_operator_count` — sum of `code_body_metrics[].operator_count` (each
+  function-body `end` already excluded per-function, so excluded here too).
+- `total_local_count` — sum of `code_body_metrics[].local_total`.
+- `instruction_family_totals` — per-family sum of each body's
+  `instruction_inventory`; families are exclusive, so the values sum to
+  `total_operator_count`. Omitted when empty.
+- `has_contract_spec` — mirrors `interface.has_contract_spec`.
+- `structure` — mirrors the resolved `structure` object; omitted when the module
+  has no memories, tables, globals, segments, or start function.
+- `reachability` — mirrors the resolved `reachability` object; omitted when the
+  module defines no functions. `unreachable_defined_count` is not a dead-code
+  judgement.
+- `analysis_finding_count` — number of findings in `analysis`; omitted when
+  `analysis` is not populated (the library-level `inspect` does not run it; the
+  CLI `inspect` command does).
 
 ## Limitations
 
@@ -445,9 +607,36 @@ Changing an event's `data_format` between any of these is reported as breaking
   inspected, so a section named `name` is not guaranteed to be a valid name
   section.
 - Code-body metrics are static counts from the encoded body; they do not
-  reflect runtime behavior, gas costs, or execution complexity.
-- `value_type` for globals is formatted via wasmparser's `Debug` impl (e.g. `I32`,
-  `I64`); this is an opaque string and may change with upstream versions.
+  reflect runtime behavior, gas costs, or execution complexity. In particular
+  `cyclomatic_complexity` is a decision-point estimate (`1 + if + br_if +
+  br_table`), not a control-flow-graph computation, and `basic_block_count` is
+  syntactic rather than target-resolved.
+- The direct call graph is static and call-site based: it does not model
+  runtime dispatch, so `call_indirect` and `call_ref` targets are not resolved
+  and `br_table` dispatch is not followed.
+- Reachability roots are limited to the start function and exported functions.
+  Functions reached only through runtime dispatch (`call_indirect`, `call_ref`),
+  host invocation, or framework-specific entry points may appear in
+  `unreachable_defined`. That field is not a dead-code or safe-to-remove
+  judgement.
+- The consolidated `summary` is purely additive and never reparses the module.
+  Its function counts are derived from `imports`/`exports`/`code_body_metrics`;
+  its body-local totals aggregate the per-function metrics. The optional
+  `summary.structure`, `summary.reachability`, and
+  `summary.analysis_finding_count` sub-objects are omitted when the source data
+  they mirror is absent, so an unavailable value is never reported as a zero.
+  `summary.instruction_family_totals` sums each body's `instruction_inventory`;
+  family counts are exclusive and thus total to `total_operator_count`.
+  `summary.has_contract_spec` mirrors `interface.has_contract_spec`.
+  `analysis_finding_count` is only populated when the CLI `inspect` command
+  attaches compatibility findings (the library-level `inspect` does not run them);
+  the `ConsistencyReport` produced by a separate entry point is not summarized.
+- Several WASM values are reported via wasmparser's `Debug` impl and are opaque
+  strings that may change with upstream versions: global `value_type` (e.g.
+  `I32`, `I64`), table `element_type` (e.g. `funcref`), element-segment
+  `element_type` (e.g. `funcref`), and element-expression `heap_type` (e.g.
+  `Func`). Note the last two differ: `element_type` is a `RefType` Debug
+  string, while `heap_type` is a `HeapType` Debug string.
 - No network access; purely local analysis.
 - Fixture provenance is documented in `tests/fixtures/README.md`. The committed
   UDT binaries were built from the original session's contract source, which is

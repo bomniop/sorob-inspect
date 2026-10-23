@@ -7,6 +7,7 @@
 //! ABI compatibility is only assessed when both specs decode; otherwise the
 //! verdict is `unknown`. See [`diff`].
 
+pub mod consistency;
 pub mod diff;
 
 use crate::wasm::{inspect, InspectError, WasmReport};
@@ -31,6 +32,10 @@ pub struct SorobanReport {
     /// Decoded contract spec, if present and parseable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<SpecReport>,
+    /// Contract-spec vs raw WASM export consistency. Present when a spec was
+    /// available (or attempted) so consumers can see what was compared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consistency: Option<crate::soroban::consistency::ConsistencyReport>,
     /// Human-readable summary of Soroban-relevant observations.
     pub summary: String,
 }
@@ -192,6 +197,17 @@ pub fn inspect_soroban(bytes: &[u8], validate: bool) -> Result<SorobanReport, So
         None
     };
 
+    // Consistency: reuse the spec we just decoded (no second decode) and the
+    // already-parsed wasm report (no reparse).
+    let consistency = if has_contract_spec {
+        Some(consistency::check_spec_export_consistency(
+            &wasm,
+            spec.as_ref(),
+        ))
+    } else {
+        None
+    };
+
     let summary = match (&spec, has_contract_spec, has_contract_env_meta) {
         (Some(s), true, true) => format!(
             "Soroban contract artifact: {} function(s), {} type(s), {} event(s) decoded from contractspecv0.",
@@ -216,6 +232,7 @@ pub fn inspect_soroban(bytes: &[u8], validate: bool) -> Result<SorobanReport, So
         has_contract_spec,
         has_contract_env_meta,
         spec,
+        consistency,
         summary,
     })
 }
@@ -471,6 +488,60 @@ mod tests {
     fn malformed_input_errors() {
         let result = inspect_soroban(&[0xff, 0xff, 0xff], false);
         assert!(result.is_err());
+    }
+
+    /// Build a minimal valid WASM module with a `contractspecv0` custom section
+    /// of the given data size, using proper LEB128 section-length encoding
+    /// (the integration-test helper only supports small sections).
+    fn wasm_with_spec_section_size(data_len: usize) -> Vec<u8> {
+        let name = b"contractspecv0";
+        let payload_len = 1 + name.len() + data_len;
+        let mut buf = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        buf.push(0x00); // custom-section id
+                        // LEB128-encode payload_len.
+        let mut n = payload_len as u64;
+        loop {
+            let mut byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                byte |= 0x80;
+            }
+            buf.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.resize(buf.len() + data_len, 0x00);
+        buf
+    }
+
+    #[test]
+    fn spec_over_limit_is_rejected() {
+        // data_len = MAX_SPEC_LEN + 1 → must return SpecTooLarge, not panic
+        // or proceed to XDR decode.
+        let wasm = wasm_with_spec_section_size(MAX_SPEC_LEN + 1);
+        let result = inspect_soroban(&wasm, false);
+        assert!(
+            matches!(result, Err(SorobanError::SpecTooLarge(n)) if n == MAX_SPEC_LEN + 1),
+            "expected SpecTooLarge({}), got {:?}",
+            MAX_SPEC_LEN + 1,
+            result
+        );
+    }
+
+    #[test]
+    fn spec_at_limit_passes_size_check() {
+        // data_len = MAX_SPEC_LEN exactly → must NOT return SpecTooLarge.
+        // The data is zero-filled (invalid XDR), so decode fails with
+        // SpecDecode; the only thing this test guards is the size boundary.
+        let wasm = wasm_with_spec_section_size(MAX_SPEC_LEN);
+        let result = inspect_soroban(&wasm, false);
+        assert!(
+            !matches!(result, Err(SorobanError::SpecTooLarge(_))),
+            "size-at-limit must not trigger SpecTooLarge"
+        );
     }
 
     #[test]

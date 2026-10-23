@@ -145,6 +145,41 @@ Expected size: 1393 bytes. Expected sha256:
 
 Note: the C–F fixtures were rebuilt from the committed source with
 stellar-cli 28.1.0 and verified byte-identical at commit time. The A/B fixtures
-predate this session and their original source was not recovered, so they are
-not claimed byte-reproducible; their integrity is enforced by decode + size
-checks in CI.
+predate this session; their original source was not recovered verbatim, but
+reconstructed equivalents are committed in `source/udt_a.rs` and `source/udt_b.rs`
+(see "Reproducing the A/B fixtures" below).
+
+### Reproducing the A/B fixtures (reconstructed source committed)
+
+```bash
+for f in a b; do
+  stellar contract init udt-$f --name udt-$f
+  cp tests/fixtures/source/udt_$f.rs udt-$f/contracts/udt-$f/src/lib.rs
+  rm -f udt-$f/contracts/udt-$f/src/test.rs
+  (cd udt-$f && stellar contract build)
+  cp udt-$f/target/wasm32v1-none/release/udt_$f.wasm \
+     tests/fixtures/udt_contract_$f.wasm
+done
+```
+
+Provenance of the committed A/B binaries:
+
+- Originals: sha256 `61525680ecd2f830181d78a64a3ea3407d8f9efeb4208bd5cd6cde7d6cd543d2`
+  (A, 3914 bytes) and `e07ffe59ca7a7a48480e0f0653fbb8302291e66d59702cb82f86454501135f36`
+  (B, 2658 bytes). Built with stellar-cli 28.1.0, soroban-sdk 28.0.0, target
+  `wasm32v1-none`.
+- Rebuilds from the committed reconstruction: sha256
+  `9ab96722416d7e62933a819dae5b292f9070fb6de8f2adb42100b4a683dd64e0` (A, 3837
+  bytes) and `7f75365015c773bbb63f50942f540d4ec7c6cb56dd2e4228b95286540bd6e862`
+  (B, 2776 bytes) — same toolchain.
+- **NOT byte-identical** (77/118-byte deltas from function-body differences the
+  reconstruction cannot recover). However, the decoded contract specs are
+  verified **identical**: same functions, param names/types/outputs, struct
+  fields, union variants, and the `StatusEvent` event (topic `id: U64`, data
+  `status: U32`, format `map`). The A↔B spec-level diff verdict and every
+  reported change line are byte-for-byte identical between the original pair
+  and the reconstructed pair, so both binaries exercise the same decoding and
+  compatibility paths.
+- The committed fixtures remain the originals; the CI integrity checks (decode
+  + size) enforce the original binaries. The committed source is the best
+  available provenance record, not a byte-exact build recipe.

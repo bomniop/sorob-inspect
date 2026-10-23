@@ -4,7 +4,7 @@
 //! so malformed/truncated input surfaces as typed errors instead of panics.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use wasmparser::{CoreType, Parser, Payload, RecGroup, TypeRef, Validator, WasmFeatures};
 
@@ -29,6 +29,12 @@ pub struct WasmReport {
     /// Empty when the module has no defined functions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_body_metrics: Vec<CodeBodyMetrics>,
+    /// Static reachability of defined functions from the module's start
+    /// function and exported functions. Present only when the module defines
+    /// at least one function. "Unreachable" here means only "not reached from
+    /// those roots" — it is not a dead-code judgement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<Reachability>,
     /// Module-level structural summary (memories, tables, globals, segments, start).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<ModuleStructure>,
@@ -39,6 +45,9 @@ pub struct WasmReport {
     /// `imports`/`exports` above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface: Option<InterfaceSummary>,
+    /// Consolidated roll-up of the results above. Always present; derived from
+    /// data already in this report and never reparses the module.
+    pub summary: AnalysisSummary,
 }
 
 /// Developer-facing overview of a module's public interface and external
@@ -597,6 +606,30 @@ struct MeasuredBody {
     /// Each operator is counted in exactly one family — classifications are
     /// exclusive, not overlapping.
     instruction_inventory: BTreeMap<&'static str, usize>,
+    /// Raw callee function indices from direct `call` / `return_call`
+    /// operators, in encounter order. Aggregated after resolution.
+    direct_call_targets: Vec<u32>,
+    /// Number of `call_indirect` / `return_call_indirect` sites. These name a
+    /// type, not a target, so no edge is invented for them.
+    indirect_call_sites: usize,
+    /// Number of `call_ref` / `return_call_ref` sites. Same reasoning: the
+    /// callee is a runtime value, not a static index.
+    reference_call_sites: usize,
+    /// Count of syntactic basic blocks (see `basic_block_count` for the exact
+    /// leader rule).
+    basic_block_count: usize,
+    /// `br_if` sites plus `if` constructs — each is a two-way decision.
+    conditional_branch_count: usize,
+    /// `br`, `br_table`, `return`, and `unreachable` sites — each transfers
+    /// control unconditionally.
+    unconditional_branch_count: usize,
+    /// `loop` constructs.
+    loop_count: usize,
+    /// `if` constructs (a subset of `conditional_branch_count`).
+    if_count: usize,
+    /// `1 + if_count + br_if_count + br_table_count`. `br_table` counts as one
+    /// decision point regardless of its target count.
+    cyclomatic_complexity: usize,
 }
 
 /// Measure a single function body's structural metrics.
@@ -624,12 +657,38 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
     let mut control_depth = 0usize;
     let mut max_control_depth = 0usize;
     let mut inventory: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut direct_call_targets: Vec<u32> = Vec::new();
+    let mut indirect_call_sites = 0usize;
+    let mut reference_call_sites = 0usize;
+    // Complexity counters, derived from the same operator traversal.
+    let mut basic_block_count = 0usize;
+    // The function entry is always a block leader.
+    let mut prev_boundary = true;
+    let mut is_first_op = true;
+    let mut conditional_branch_count = 0usize;
+    let mut unconditional_branch_count = 0usize;
+    let mut loop_count = 0usize;
+    let mut if_count = 0usize;
+    let mut br_if_count = 0usize;
+    let mut br_table_count = 0usize;
 
     loop {
         let op = op_reader.read().map_err(|e| e.to_string())?;
         use wasmparser::Operator;
+
+        // A new basic block starts whenever the previous operator was a
+        // control-flow boundary. Computed before the match so `op` can still
+        // be borrowed here even when an arm binds out of it.
+        let counted_as_leader = prev_boundary;
+        if prev_boundary {
+            basic_block_count = basic_block_count
+                .checked_add(1)
+                .ok_or("basic block count overflow")?;
+        }
+        let is_boundary = is_block_boundary(&op);
+
         match op {
-            Operator::Block { .. } | Operator::Loop { .. } => {
+            Operator::Block { .. } => {
                 control_depth = control_depth
                     .checked_add(1)
                     .ok_or("control depth overflow")?;
@@ -640,6 +699,19 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
                     .checked_add(1)
                     .ok_or("operator count overflow")?;
                 *inventory.entry("control").or_insert(0) += 1;
+            }
+            Operator::Loop { .. } => {
+                control_depth = control_depth
+                    .checked_add(1)
+                    .ok_or("control depth overflow")?;
+                if control_depth > max_control_depth {
+                    max_control_depth = control_depth;
+                }
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+                loop_count = loop_count.checked_add(1).ok_or("loop count overflow")?;
             }
             Operator::If { .. } => {
                 control_depth = control_depth
@@ -652,6 +724,10 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
                     .checked_add(1)
                     .ok_or("operator count overflow")?;
                 *inventory.entry("control").or_insert(0) += 1;
+                if_count = if_count.checked_add(1).ok_or("if count overflow")?;
+                conditional_branch_count = conditional_branch_count
+                    .checked_add(1)
+                    .ok_or("conditional branch count overflow")?;
             }
             Operator::Else => {
                 // `else` continues the enclosing `if`; it opens no new block.
@@ -671,29 +747,68 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
                     .ok_or("operator count overflow")?;
                 *inventory.entry("control").or_insert(0) += 1;
             }
-            Operator::Br { .. } | Operator::BrIf { .. } | Operator::BrTable { .. } => {
+            Operator::Br { .. } => {
                 operator_count = operator_count
                     .checked_add(1)
                     .ok_or("operator count overflow")?;
                 *inventory.entry("control").or_insert(0) += 1;
+                unconditional_branch_count = unconditional_branch_count
+                    .checked_add(1)
+                    .ok_or("unconditional branch count overflow")?;
+            }
+            Operator::BrIf { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+                br_if_count = br_if_count.checked_add(1).ok_or("br_if count overflow")?;
+                conditional_branch_count = conditional_branch_count
+                    .checked_add(1)
+                    .ok_or("conditional branch count overflow")?;
+            }
+            Operator::BrTable { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+                br_table_count = br_table_count
+                    .checked_add(1)
+                    .ok_or("br_table count overflow")?;
+                unconditional_branch_count = unconditional_branch_count
+                    .checked_add(1)
+                    .ok_or("unconditional branch count overflow")?;
             }
             Operator::Return => {
                 operator_count = operator_count
                     .checked_add(1)
                     .ok_or("operator count overflow")?;
                 *inventory.entry("control").or_insert(0) += 1;
+                unconditional_branch_count = unconditional_branch_count
+                    .checked_add(1)
+                    .ok_or("unconditional branch count overflow")?;
             }
-            Operator::Call { .. } | Operator::CallIndirect { .. } => {
+            Operator::Call { function_index } => {
                 operator_count = operator_count
                     .checked_add(1)
                     .ok_or("operator count overflow")?;
                 *inventory.entry("call").or_insert(0) += 1;
+                direct_call_targets.push(function_index);
             }
-            Operator::ReturnCall { .. } | Operator::ReturnCallIndirect { .. } => {
+            Operator::ReturnCall { function_index } => {
                 operator_count = operator_count
                     .checked_add(1)
                     .ok_or("operator count overflow")?;
                 *inventory.entry("call").or_insert(0) += 1;
+                direct_call_targets.push(function_index);
+            }
+            Operator::CallIndirect { .. } | Operator::ReturnCallIndirect { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("call").or_insert(0) += 1;
+                indirect_call_sites = indirect_call_sites
+                    .checked_add(1)
+                    .ok_or("indirect call site count overflow")?;
             }
             Operator::LocalGet { .. } | Operator::LocalSet { .. } | Operator::LocalTee { .. } => {
                 operator_count = operator_count
@@ -943,7 +1058,16 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
                     .ok_or("operator count overflow")?;
                 *inventory.entry("select").or_insert(0) += 1;
             }
-            Operator::Drop | Operator::Nop | Operator::Unreachable => {
+            Operator::Unreachable => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("misc").or_insert(0) += 1;
+                unconditional_branch_count = unconditional_branch_count
+                    .checked_add(1)
+                    .ok_or("unconditional branch count overflow")?;
+            }
+            Operator::Drop | Operator::Nop => {
                 operator_count = operator_count
                     .checked_add(1)
                     .ok_or("operator count overflow")?;
@@ -990,6 +1114,9 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
                     .checked_add(1)
                     .ok_or("operator count overflow")?;
                 *inventory.entry("call").or_insert(0) += 1;
+                reference_call_sites = reference_call_sites
+                    .checked_add(1)
+                    .ok_or("reference call site count overflow")?;
             }
             Operator::BrOnNull { .. } | Operator::BrOnNonNull { .. } => {
                 operator_count = operator_count
@@ -1343,6 +1470,8 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
                 *inventory.entry("other").or_insert(0) += 1;
             }
         }
+        prev_boundary = is_boundary;
+
         // The function-body end is the last operator in the body. The
         // operators reader reports EOF after it, so we detect it by checking
         // whether the reader is exhausted.
@@ -1355,9 +1484,28 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
             if let Some(c) = inventory.get_mut("control") {
                 *c = c.checked_sub(1).expect("control count underflow");
             }
+            // The function-body `end` terminates the implicit function block;
+            // nothing follows it, so it must not start a new basic block. The
+            // one exception is an otherwise-empty body, where the single
+            // counted block is the (empty) entry block and must be kept.
+            if counted_as_leader && !is_first_op {
+                basic_block_count = basic_block_count
+                    .checked_sub(1)
+                    .expect("basic block count underflow");
+            }
             break;
         }
+        is_first_op = false;
     }
+
+    // Cyclomatic-complexity estimate: 1 + decision points, where a decision
+    // point is each `if`, `br_if`, or `br_table`. `br_table` counts as one
+    // decision point regardless of its target count.
+    let cyclomatic_complexity = 1usize
+        .checked_add(if_count)
+        .and_then(|n| n.checked_add(br_if_count))
+        .and_then(|n| n.checked_add(br_table_count))
+        .ok_or("cyclomatic complexity overflow")?;
 
     Ok(MeasuredBody {
         body_len_bytes,
@@ -1366,7 +1514,237 @@ fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody,
         operator_count,
         max_control_depth,
         instruction_inventory: inventory.into_iter().filter(|(_, v)| *v > 0).collect(),
+        direct_call_targets,
+        indirect_call_sites,
+        reference_call_sites,
+        basic_block_count,
+        conditional_branch_count,
+        unconditional_branch_count,
+        loop_count,
+        if_count,
+        cyclomatic_complexity,
     })
+}
+
+/// Whether an operator ends the current basic block, so the next operator
+/// starts a new one.
+///
+/// Boundaries are: the block-introducing constructs (`block`, `loop`, `if`),
+/// `else`, `end`, and the control transfers `br`, `br_if`, `br_table`,
+/// `return`, and `unreachable`. `call` and its variants are not boundaries —
+/// they return to the next instruction. The function-body `end` is a boundary
+/// too, but nothing follows it, so it never contributes a block.
+fn is_block_boundary(op: &wasmparser::Operator<'_>) -> bool {
+    use wasmparser::Operator;
+    matches!(
+        op,
+        Operator::Block { .. }
+            | Operator::Loop { .. }
+            | Operator::If { .. }
+            | Operator::Else
+            | Operator::End
+            | Operator::Br { .. }
+            | Operator::BrIf { .. }
+            | Operator::BrTable { .. }
+            | Operator::Return
+            | Operator::Unreachable
+    )
+}
+
+/// Resolve raw direct-call targets into deterministic call edges.
+///
+/// Repeated call sites to the same callee are aggregated into one edge with a
+/// `call_count`, and the resulting edge list is sorted by callee index. An
+/// index that names no function resolves to `CallTargetResolution::Invalid` —
+/// reported, never dropped or panicked on.
+fn resolve_call_edges(
+    targets: Vec<u32>,
+    imports: &[ImportEntry],
+    imported_func_type_idx: &[u32],
+    func_type_idx: &[u32],
+    types: &[String],
+) -> Vec<CallEdge> {
+    let imported_func_count = imported_func_type_idx.len();
+
+    // Aggregate identical callees so the edge list is bounded by distinct
+    // targets, not by operator count. The order of first encounter is
+    // irrelevant because the result is sorted below.
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for t in targets {
+        *counts.entry(t).or_insert(0) += 1;
+    }
+
+    counts
+        .into_iter()
+        .map(|(callee_index, call_count)| {
+            let resolution = resolve_call_target(
+                callee_index,
+                imports,
+                imported_func_count,
+                func_type_idx,
+                types,
+            );
+            CallEdge {
+                callee_index,
+                call_count,
+                resolution,
+            }
+        })
+        .collect()
+}
+
+/// Resolve one callee index against the module's function index space.
+///
+/// Imported functions occupy the lowest indices, then locally defined
+/// functions in declaration order. An index naming no function resolves to
+/// `Invalid`.
+fn resolve_call_target(
+    callee_index: u32,
+    imports: &[ImportEntry],
+    imported_func_count: usize,
+    func_type_idx: &[u32],
+    types: &[String],
+) -> CallTargetResolution {
+    let i = callee_index as usize;
+    if i < imported_func_count {
+        // Resolves to an imported function: report which import.
+        let mut count = 0usize;
+        for imp in imports {
+            if imp.kind == "function" {
+                if count == i {
+                    return CallTargetResolution::Imported {
+                        module: imp.module.clone(),
+                        name: imp.name.clone(),
+                    };
+                }
+                count += 1;
+            }
+        }
+        CallTargetResolution::Invalid
+    } else {
+        match i.checked_sub(imported_func_count) {
+            Some(local) => match func_type_idx.get(local) {
+                Some(type_idx) => CallTargetResolution::Defined {
+                    defined_index: local,
+                    signature: types.get(*type_idx as usize).cloned(),
+                },
+                None => CallTargetResolution::Invalid,
+            },
+            None => CallTargetResolution::Invalid,
+        }
+    }
+}
+
+/// Compute static reachability from the module's conservatively selected roots.
+///
+/// Reuses the already-resolved `code_body_metrics` direct-call graph, the
+/// resolved exports, and the resolved start function. It never reparses the
+/// module and never invents a root for runtime dispatch, indirect calls,
+/// reference calls, host behavior, or framework entry points.
+fn compute_reachability(
+    exports: &[ExportEntry],
+    start_function: Option<&StartFunction>,
+    code_body_metrics: &[CodeBodyMetrics],
+    imported_func_count: usize,
+) -> Reachability {
+    let defined_count = code_body_metrics.len();
+
+    // Resolve a raw function index to (resolution, defined_index). Same
+    // index-space rule as every other resolution in this module: imported
+    // functions occupy the lowest indices, then defined functions in
+    // declaration order.
+    let resolve = |index: u32| -> (String, Option<usize>) {
+        let i = index as usize;
+        if i < imported_func_count {
+            ("imported".to_string(), None)
+        } else {
+            match i.checked_sub(imported_func_count) {
+                Some(local) if local < defined_count => ("defined".to_string(), Some(local)),
+                _ => ("invalid".to_string(), None),
+            }
+        }
+    };
+
+    // Collect roots: the start function (when present) and exported functions.
+    let mut roots: Vec<ReachabilityRoot> = Vec::new();
+    if let Some(start) = start_function {
+        let (resolution, defined_index) = match start.resolution.as_str() {
+            // The resolved start detail already carries the declared index.
+            "defined" => match start.function.as_ref() {
+                Some(sig) => ("defined".to_string(), Some(sig.declared_index as usize)),
+                None => resolve(start.index),
+            },
+            _ => resolve(start.index),
+        };
+        roots.push(ReachabilityRoot {
+            kind: "start".to_string(),
+            name: None,
+            function_index: start.index,
+            resolution,
+            defined_index,
+        });
+    }
+    for export in exports.iter().filter(|e| e.kind == "function") {
+        let (resolution, defined_index) = resolve(export.index);
+        roots.push(ReachabilityRoot {
+            kind: "export".to_string(),
+            name: Some(export.name.clone()),
+            function_index: export.index,
+            resolution,
+            defined_index,
+        });
+    }
+    // Deterministic order: start first, then exports by function index, then
+    // by export name for any remaining ties.
+    roots.sort_by(|a, b| {
+        let rank = |k: &str| if k == "start" { 0 } else { 1 };
+        rank(&a.kind)
+            .cmp(&rank(&b.kind))
+            .then(a.function_index.cmp(&b.function_index))
+            .then(a.name.cmp(&b.name))
+    });
+
+    // Breadth-first traversal over direct-call edges from defined roots.
+    let mut reached: BTreeSet<usize> = BTreeSet::new();
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for root in &roots {
+        if let Some(d) = root.defined_index {
+            queue.push_back(d);
+        }
+    }
+    while let Some(d) = queue.pop_front() {
+        if !reached.insert(d) {
+            continue;
+        }
+        // Guard the lookup: a malformed module could in principle carry an
+        // edge to a defined index with no body entry. Skip rather than panic.
+        let Some(metrics) = code_body_metrics.get(d) else {
+            continue;
+        };
+        for edge in &metrics.direct_calls {
+            match &edge.resolution {
+                CallTargetResolution::Defined { defined_index, .. } => {
+                    if !reached.contains(defined_index) {
+                        queue.push_back(*defined_index);
+                    }
+                }
+                // Imported callees have no body in this module: the traversal
+                // stops there. Invalid callees name nothing: also a stop.
+                CallTargetResolution::Imported { .. } | CallTargetResolution::Invalid => {}
+            }
+        }
+    }
+
+    let reachable_defined: Vec<usize> = reached.iter().copied().collect();
+    let unreachable_defined: Vec<usize> = (0..defined_count)
+        .filter(|d| !reached.contains(d))
+        .collect();
+
+    Reachability {
+        roots,
+        reachable_defined,
+        unreachable_defined,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -1616,6 +1994,354 @@ pub struct CodeBodyMetrics {
     /// overlapping. Omitted when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub instruction_inventory: BTreeMap<String, usize>,
+    /// Direct call sites in the body, counting repeated calls to the same
+    /// callee separately. This is `call` + `return_call` occurrences, i.e. the
+    /// sum of `call_count` over `direct_calls`. It is distinct from
+    /// `direct_calls.len()`, which counts distinct callees.
+    pub direct_call_site_count: usize,
+    /// Direct call edges, one entry per distinct callee, sorted by callee
+    /// index. `call_count` aggregates repeated call sites to the same target.
+    /// Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_calls: Vec<CallEdge>,
+    /// Number of `call_indirect` / `return_call_indirect` sites in the body.
+    /// These name a type, not a target, so no edge is invented for them.
+    /// Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub indirect_call_sites: usize,
+    /// Number of `call_ref` / `return_call_ref` sites in the body. The callee
+    /// is a runtime value, not a static index, so no edge is invented for them.
+    /// Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reference_call_sites: usize,
+    /// Count of syntactic basic blocks. A basic block is a maximal run of
+    /// operators with no interior control-flow boundary. Leaders (the first
+    /// operator of a block) are: the function's first operator, the operator
+    /// after each `block` / `loop` / `if`, `else`, `end`, `br`, `br_if`,
+    /// `br_table`, `return`, or `unreachable`. Branch targets are not resolved
+    /// to instructions, so this is a syntactic count, not a control-flow-graph
+    /// block count.
+    pub basic_block_count: usize,
+    /// `br_if` sites plus `if` constructs. Each is a two-way decision point.
+    pub conditional_branch_count: usize,
+    /// `br`, `br_table`, `return`, and `unreachable` sites. Each transfers
+    /// control unconditionally, so control does not fall through it.
+    pub unconditional_branch_count: usize,
+    /// `loop` constructs.
+    pub loop_count: usize,
+    /// `if` constructs. A subset of `conditional_branch_count`; the remainder
+    /// of that count is `br_if`.
+    pub if_count: usize,
+    /// Cyclomatic-complexity estimate: `1 + if_count + br_if_count +
+    /// br_table_count`, i.e. one plus the number of decision points. Each
+    /// `br_table` counts as a single decision point regardless of how many
+    /// targets it names, and `br` / `return` / `unreachable` are not decision
+    /// points. It is not a full control-flow-graph computation and is not a
+    /// measure of execution cost, security, or runtime performance.
+    pub cyclomatic_complexity: usize,
+}
+
+/// One direct call edge from a defined function body to a callee.
+///
+/// Repeated call sites to the same callee are aggregated into a single edge
+/// with `call_count` reflecting the number of sites, so the edge list stays
+/// bounded by the number of distinct callees rather than the number of
+/// operators.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CallEdge {
+    /// Raw WASM function index of the callee (imported functions occupy the
+    /// lowest indices, then defined functions in declaration order).
+    pub callee_index: u32,
+    /// How many direct call sites in this body target `callee_index`.
+    pub call_count: usize,
+    /// How the callee index resolved against the module's function index space.
+    pub resolution: CallTargetResolution,
+}
+
+/// Resolution of a direct call target against the module's function index space.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CallTargetResolution {
+    /// Resolves to an imported function; carries the import's module and name.
+    Imported { module: String, name: String },
+    /// Resolves to a locally defined function; carries its 0-based position
+    /// among defined functions and its rendered signature.
+    Defined {
+        defined_index: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// The index names no function in this module's index space. Reported
+    /// rather than dropped or panicked on.
+    Invalid,
+}
+
+/// Serde helper: `true` when the value is zero, so zero-valued counters are
+/// omitted from JSON.
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Consolidated, deterministic summary of results already computed by
+/// `inspect`.
+///
+/// Every field is derived from data the analyzer has already produced: the
+/// summary never reparses the module and never runs a new analysis. It exists
+/// so a consumer can read the headline counts without walking the underlying
+/// arrays.
+///
+/// Counts that mirror a single source field are documented as such. Optional
+/// sub-objects are omitted rather than zero-filled when their source is
+/// absent, so "unavailable" is never confused with "zero".
+///
+/// This is a structural roll-up only. It carries no security score, safety
+/// verdict, or compatibility claim.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct AnalysisSummary {
+    /// Number of custom sections. Mirrors `custom_sections.len()`.
+    pub custom_section_count: usize,
+    /// Imported functions: `imports` entries whose `kind` is `"function"`.
+    pub imported_function_count: usize,
+    /// Exported functions: `exports` entries whose `kind` is `"function"`.
+    pub exported_function_count: usize,
+    /// Locally defined functions, i.e. functions with a body. Mirrors
+    /// `code_body_metrics.len()`.
+    pub defined_function_count: usize,
+    /// `imported_function_count + defined_function_count` — the size of the
+    /// module's function index space.
+    pub total_function_count: usize,
+    /// Sum of `code_body_metrics[].body_len_bytes`. Zero when the module
+    /// defines no functions.
+    pub total_body_bytes: usize,
+    /// Sum of `code_body_metrics[].operator_count`. Each function-body `end`
+    /// is already excluded from the per-function count, so the aggregate
+    /// excludes all of them.
+    pub total_operator_count: usize,
+    /// Sum of `code_body_metrics[].local_total`: every declared local across
+    /// all defined functions.
+    pub total_local_count: usize,
+    /// Per-family instruction counts summed across all defined functions,
+    /// sorted by family name. The families are the same exclusive
+    /// classification each body uses in `instruction_inventory`, so these
+    /// values sum to `total_operator_count`. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instruction_family_totals: BTreeMap<String, usize>,
+    /// True when a `contractspecv0` custom section is present. Mirrors
+    /// `interface.has_contract_spec`.
+    pub has_contract_spec: bool,
+    /// Structure counts, mirrored from the resolved `structure` object.
+    /// Omitted when the module declares no memories, tables, globals,
+    /// segments, or start function — i.e. when `structure` itself is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structure: Option<StructureSummary>,
+    /// Reachability counts. Omitted when the module defines no functions —
+    /// i.e. when `reachability` itself is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<ReachabilitySummary>,
+    /// Number of compatibility findings in `analysis`. Omitted when `analysis`
+    /// was not populated: the library-level `inspect` does not run it, only
+    /// the CLI's `inspect` command does. Contract-spec consistency findings
+    /// live in the separate `ConsistencyReport` produced by
+    /// `soroban::consistency`, which `inspect` does not compute, and are
+    /// therefore not summarized here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_finding_count: Option<usize>,
+}
+
+/// Module-structure counts, mirrored from `ModuleStructure`.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct StructureSummary {
+    /// Defined (non-imported) memories. Mirrors `structure.memories.len()`.
+    pub memory_count: usize,
+    /// Defined (non-imported) tables. Mirrors `structure.tables.len()`.
+    pub table_count: usize,
+    /// Defined (non-imported) globals. Mirrors `structure.globals.len()`.
+    pub global_count: usize,
+    /// Mirrors `structure.data_segments`.
+    pub data_segment_count: usize,
+    /// Mirrors `structure.element_segments`.
+    pub element_segment_count: usize,
+    /// True when the module has a start section. Mirrors
+    /// `structure.start_func.is_some()`.
+    pub has_start_function: bool,
+}
+
+/// Reachability counts, mirrored from `Reachability`.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReachabilitySummary {
+    /// Known roots: the start function (when present and valid) plus exported
+    /// functions. Mirrors `reachability.roots.len()`.
+    pub root_count: usize,
+    /// Defined functions reached from those roots. Mirrors
+    /// `reachability.reachable_defined.len()`.
+    pub reachable_defined_count: usize,
+    /// Defined functions not reached from those roots. Mirrors
+    /// `reachability.unreachable_defined.len()`. Not a dead-code judgement.
+    pub unreachable_defined_count: usize,
+}
+
+impl AnalysisSummary {
+    /// A zero-valued summary used as the placeholder while a report is being
+    /// assembled. `inspect` always overwrites it before returning.
+    fn empty() -> Self {
+        Self {
+            custom_section_count: 0,
+            imported_function_count: 0,
+            exported_function_count: 0,
+            defined_function_count: 0,
+            total_function_count: 0,
+            total_body_bytes: 0,
+            total_operator_count: 0,
+            total_local_count: 0,
+            instruction_family_totals: BTreeMap::new(),
+            has_contract_spec: false,
+            structure: None,
+            reachability: None,
+            analysis_finding_count: None,
+        }
+    }
+}
+
+/// Build the consolidated summary from an already-resolved report.
+///
+/// Pure derivation: it reads only fields already present on `report`, so it
+/// can neither reparse the module nor alter any existing result. Checked
+/// arithmetic is used throughout, so a malformed aggregate surfaces as a typed
+/// error rather than a panic or a silently wrapped count.
+///
+/// Callers that mutate the report after `inspect` — for example the CLI, which
+/// attaches `analysis` — can call this again to refresh the summary.
+pub fn build_analysis_summary(report: &WasmReport) -> Result<AnalysisSummary, InspectError> {
+    let overflow = |what: &str| InspectError::Malformed(format!("summary {what} overflow"));
+
+    let imported_function_count = report
+        .imports
+        .iter()
+        .filter(|i| i.kind == "function")
+        .count();
+    let exported_function_count = report
+        .exports
+        .iter()
+        .filter(|e| e.kind == "function")
+        .count();
+    let defined_function_count = report.code_body_metrics.len();
+
+    let mut total_body_bytes = 0usize;
+    let mut total_operator_count = 0usize;
+    let mut total_local_count = 0usize;
+    let mut instruction_family_totals: BTreeMap<String, usize> = BTreeMap::new();
+    for m in &report.code_body_metrics {
+        total_body_bytes = total_body_bytes
+            .checked_add(m.body_len_bytes)
+            .ok_or_else(|| overflow("body byte total"))?;
+        total_operator_count = total_operator_count
+            .checked_add(m.operator_count)
+            .ok_or_else(|| overflow("operator total"))?;
+        total_local_count = total_local_count
+            .checked_add(m.local_total)
+            .ok_or_else(|| overflow("local total"))?;
+        for (family, count) in &m.instruction_inventory {
+            let slot = instruction_family_totals.entry(family.clone()).or_insert(0);
+            *slot = slot
+                .checked_add(*count)
+                .ok_or_else(|| overflow("instruction family total"))?;
+        }
+    }
+
+    let structure = report.structure.as_ref().map(|s| StructureSummary {
+        memory_count: s.memories.len(),
+        table_count: s.tables.len(),
+        global_count: s.globals.len(),
+        data_segment_count: s.data_segments,
+        element_segment_count: s.element_segments,
+        has_start_function: s.start_func.is_some(),
+    });
+
+    let reachability = report.reachability.as_ref().map(|r| ReachabilitySummary {
+        root_count: r.roots.len(),
+        reachable_defined_count: r.reachable_defined.len(),
+        unreachable_defined_count: r.unreachable_defined.len(),
+    });
+
+    // Prefer the already-resolved interface flag so the two cannot diverge;
+    // fall back to the same rule when the interface is absent.
+    let has_contract_spec = report
+        .interface
+        .as_ref()
+        .map(|i| i.has_contract_spec)
+        .unwrap_or_else(|| {
+            report
+                .custom_sections
+                .iter()
+                .any(|s| s.name == "contractspecv0")
+        });
+
+    let analysis_finding_count = report.analysis.as_ref().map(|a| a.findings.len());
+
+    Ok(AnalysisSummary {
+        custom_section_count: report.custom_sections.len(),
+        imported_function_count,
+        exported_function_count,
+        defined_function_count,
+        total_function_count: imported_function_count
+            .checked_add(defined_function_count)
+            .ok_or_else(|| overflow("function total"))?,
+        total_body_bytes,
+        total_operator_count,
+        total_local_count,
+        instruction_family_totals,
+        has_contract_spec,
+        structure,
+        reachability,
+        analysis_finding_count,
+    })
+}
+
+/// Static reachability of defined functions from conservatively selected roots.
+///
+/// Roots are limited to the module's start function (when present and valid)
+/// and its exported functions. Traversal follows direct `call` / `return_call`
+/// edges only, through the already-decoded direct-call graph — the WASM is
+/// never reparsed.
+///
+/// "Unreachable" means only *not reached from the selected static roots*.
+/// It is NOT a dead-code judgement and NOT a safe-to-remove signal: functions
+/// reached at runtime through `call_indirect`, `call_ref`, host invocation, or
+/// a framework's own entry points may legitimately appear unreachable here.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Reachability {
+    /// Known roots, in deterministic order (start first, then exports by
+    /// index). Imported roots are listed with their resolution so the
+    /// distinction from defined roots stays visible.
+    pub roots: Vec<ReachabilityRoot>,
+    /// Defined functions reached from the roots, sorted ascending by defined
+    /// index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachable_defined: Vec<usize>,
+    /// Defined functions not reached from the roots, sorted ascending by
+    /// defined index. Absence here means every defined function was reached.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreachable_defined: Vec<usize>,
+}
+
+/// One known root of the reachability analysis.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReachabilityRoot {
+    /// `"start"` for the WASM start function, `"export"` for an exported
+    /// function.
+    pub kind: String,
+    /// Export name; present only when `kind == "export"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Raw WASM function index (imported functions occupy the lowest indices,
+    /// then defined functions in declaration order).
+    pub function_index: u32,
+    /// `"defined"`, `"imported"`, or `"invalid"`.
+    pub resolution: String,
+    /// 0-based position among defined functions; present only when
+    /// `resolution == "defined"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defined_index: Option<usize>,
 }
 
 /// Errors that can occur during inspection.
@@ -1656,10 +2382,12 @@ pub fn inspect(bytes: &[u8], validate: bool) -> Result<WasmReport, InspectError>
         custom_sections: Vec::new(),
         custom_section_details: Vec::new(),
         code_body_metrics: Vec::new(),
+        reachability: None,
         functions: Vec::new(),
         structure: None,
         analysis: None,
         interface: None,
+        summary: AnalysisSummary::empty(),
     };
 
     // Module-structure accumulators (only emitted when non-empty).
@@ -2046,9 +2774,40 @@ pub fn inspect(bytes: &[u8], validate: bool) -> Result<WasmReport, InspectError>
                     .into_iter()
                     .map(|(k, v)| (k.to_string(), v))
                     .collect(),
+                // Total direct call sites, derived from the collected raw
+                // targets before they are aggregated into edges.
+                direct_call_site_count: metrics.direct_call_targets.len(),
+                direct_calls: resolve_call_edges(
+                    metrics.direct_call_targets,
+                    &report.imports,
+                    &imported_func_type_idx,
+                    &func_type_idx,
+                    &types,
+                ),
+                indirect_call_sites: metrics.indirect_call_sites,
+                reference_call_sites: metrics.reference_call_sites,
+                basic_block_count: metrics.basic_block_count,
+                conditional_branch_count: metrics.conditional_branch_count,
+                unconditional_branch_count: metrics.unconditional_branch_count,
+                loop_count: metrics.loop_count,
+                if_count: metrics.if_count,
+                cyclomatic_complexity: metrics.cyclomatic_complexity,
             })
         })
         .collect::<Result<Vec<_>, InspectError>>()?;
+
+    // Static reachability from the module's conservatively selected roots
+    // (start function + exported functions), over the direct-call graph that
+    // was just built. Emitted only when the module defines at least one
+    // function, so modules without bodies keep the previous JSON shape.
+    if !report.code_body_metrics.is_empty() {
+        report.reachability = Some(compute_reachability(
+            &report.exports,
+            start_function.as_ref(),
+            &report.code_body_metrics,
+            imported_func_count,
+        ));
+    }
 
     // Emit the structure summary only when the module declares any of these
     // items, so modules without them keep the previous JSON shape.
@@ -2101,6 +2860,10 @@ pub fn inspect(bytes: &[u8], validate: bool) -> Result<WasmReport, InspectError>
     // Interface summary is derived from the resolved import/export vectors, so
     // it is built last and never touches the raw bytes.
     report.interface = Some(build_interface_summary(&report));
+
+    // Consolidated summary, built last so it sees the fully-resolved report.
+    // Pure derivation: no reparsing, no new analysis.
+    report.summary = build_analysis_summary(&report)?;
 
     Ok(report)
 }
@@ -4007,5 +4770,924 @@ mod tests {
         let report = inspect(&wasm, false).unwrap();
         let inv = inv(&report);
         assert_eq!(inv.get("control"), Some(&3), "if + else + end");
+    }
+
+    // --- Complexity metric tests ---
+
+    /// A body's metrics entry, for readability in the tests below.
+    fn m(report: &WasmReport) -> &CodeBodyMetrics {
+        &report.code_body_metrics[0]
+    }
+
+    #[test]
+    fn complexity_straight_line_body() {
+        // call, add, nop — no control flow, no calls to follow.
+        let wasm = module_with_ops(&[0x01, 0x6a, 0x10, 0x00]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = m(&report);
+        assert_eq!(m.basic_block_count, 1, "one straight-line block");
+        assert_eq!(m.conditional_branch_count, 0);
+        assert_eq!(m.unconditional_branch_count, 0);
+        assert_eq!(m.loop_count, 0);
+        assert_eq!(m.if_count, 0);
+        assert_eq!(m.cyclomatic_complexity, 1, "no decision points");
+        assert_eq!(m.direct_call_site_count, 1, "one direct call site");
+        assert_eq!(m.max_control_depth, 0);
+    }
+
+    #[test]
+    fn complexity_empty_body() {
+        // 0 locals, just the function-body end.
+        let wasm = module_with_one_body(&[0x00, 0x0b]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = m(&report);
+        assert_eq!(m.basic_block_count, 1, "the empty entry block still counts");
+        assert_eq!(m.operator_count, 0);
+        assert_eq!(m.cyclomatic_complexity, 1);
+        assert_eq!(m.direct_call_site_count, 0);
+        assert_eq!(m.max_control_depth, 0);
+    }
+
+    #[test]
+    fn complexity_br_if_is_conditional() {
+        // br_if 0 is a two-way decision: falls through or branches.
+        let wasm = module_with_ops(&[0x0d, 0x00]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = m(&report);
+        assert_eq!(m.conditional_branch_count, 1);
+        assert_eq!(m.unconditional_branch_count, 0);
+        assert_eq!(m.if_count, 0, "br_if is not an if construct");
+        assert_eq!(m.cyclomatic_complexity, 2);
+    }
+
+    #[test]
+    fn complexity_br_is_unconditional() {
+        let wasm = module_with_ops(&[0x0c, 0x00]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = m(&report);
+        assert_eq!(m.unconditional_branch_count, 1);
+        assert_eq!(m.conditional_branch_count, 0);
+        assert_eq!(m.cyclomatic_complexity, 1, "br is not a decision point");
+    }
+
+    #[test]
+    fn complexity_if_construct() {
+        // if / nop / end
+        let wasm = module_with_ops(&[0x04, 0x40, 0x01, 0x0b]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = m(&report);
+        assert_eq!(m.if_count, 1);
+        assert_eq!(m.conditional_branch_count, 1);
+        assert_eq!(m.max_control_depth, 1);
+        assert_eq!(m.loop_count, 0);
+        assert_eq!(m.cyclomatic_complexity, 2);
+    }
+
+    #[test]
+    fn complexity_loop_construct() {
+        // loop / end
+        let wasm = module_with_ops(&[0x03, 0x40, 0x0b]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = m(&report);
+        assert_eq!(m.loop_count, 1);
+        assert_eq!(m.max_control_depth, 1);
+        assert_eq!(m.if_count, 0);
+        assert_eq!(
+            m.cyclomatic_complexity, 1,
+            "a bare loop is not a decision point"
+        );
+    }
+
+    #[test]
+    fn complexity_nested_control_flow() {
+        // block / loop / if / end / end / end
+        let wasm = module_with_ops(&[0x02, 0x40, 0x03, 0x40, 0x04, 0x40, 0x0b, 0x0b, 0x0b]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = m(&report);
+        assert_eq!(m.max_control_depth, 3);
+        assert_eq!(m.loop_count, 1);
+        assert_eq!(m.if_count, 1);
+        assert_eq!(m.cyclomatic_complexity, 2);
+        assert_eq!(m.conditional_branch_count, 1);
+        assert_eq!(m.unconditional_branch_count, 0);
+    }
+
+    #[test]
+    fn complexity_repeated_calls_are_separate_sites() {
+        // Two calls to the same target: one edge, two sites.
+        let wasm =
+            module_with_bodies(&[body_with_ops(&[0x10, 0x01, 0x10, 0x01]), body_with_ops(&[])]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.direct_call_site_count, 2, "sites count repeats");
+        assert_eq!(
+            m.direct_calls.len(),
+            1,
+            "but edges collapse to distinct callees"
+        );
+        assert_eq!(m.direct_calls[0].call_count, 2);
+    }
+
+    #[test]
+    fn complexity_basic_block_leaders() {
+        // br_if splits the block: entry, then the post-branch continuation.
+        let wasm = module_with_ops(&[0x0d, 0x00, 0x01, 0x6a]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = m(&report);
+        assert_eq!(m.basic_block_count, 2, "br_if starts a new block after it");
+    }
+
+    #[test]
+    fn complexity_json_is_deterministic() {
+        let build = || module_with_ops(&[0x02, 0x40, 0x0d, 0x00, 0x10, 0x00, 0x0b]);
+        let first = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        let second = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        assert_eq!(first, second, "complexity JSON must be deterministic");
+    }
+
+    #[test]
+    fn complexity_json_is_additive_and_complete() {
+        let wasm = module_with_ops(&[0x04, 0x40, 0x01, 0x0b]);
+        let report = inspect(&wasm, false).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entry = &value["code_body_metrics"][0];
+        for field in [
+            "body_len_bytes",
+            "local_decl_count",
+            "local_total",
+            "operator_count",
+            "max_control_depth",
+            "instruction_inventory",
+            "direct_call_site_count",
+            "basic_block_count",
+            "conditional_branch_count",
+            "unconditional_branch_count",
+            "loop_count",
+            "if_count",
+            "cyclomatic_complexity",
+        ] {
+            assert!(entry.get(field).is_some(), "field {field} present");
+        }
+    }
+
+    #[test]
+    fn complexity_zero_counts_are_present_not_omitted() {
+        // The complexity counters are plain counts, so a zero is meaningful and
+        // must still be emitted.
+        let wasm = module_with_one_body(&[0x00, 0x0b]);
+        let report = inspect(&wasm, false).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entry = &value["code_body_metrics"][0];
+        assert_eq!(entry["loop_count"], 0);
+        assert_eq!(entry["if_count"], 0);
+        assert_eq!(entry["conditional_branch_count"], 0);
+        assert_eq!(entry["cyclomatic_complexity"], 1);
+    }
+
+    // --- Direct call graph tests ---
+
+    /// Build a module with `n` defined functions, each with the given body
+    /// bytes (`bodies[i]` is the raw body for defined function `i`, excluding
+    /// the body-size prefix).
+    fn module_with_bodies(bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&function_section(bodies.len()));
+        let mut payload = vec![bodies.len() as u8];
+        for body in bodies {
+            payload.push(body.len() as u8);
+            payload.extend_from_slice(body);
+        }
+        let mut code = vec![0x0a];
+        code.extend_from_slice(&leb(payload.len() as u32));
+        code.extend_from_slice(&payload);
+        b.extend_from_slice(&code);
+        b
+    }
+
+    /// A body with 0 locals that executes `ops` then `end`.
+    fn body_with_ops(ops: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00];
+        v.extend_from_slice(ops);
+        v.push(0x0b);
+        v
+    }
+
+    // --- Reachability test helpers ---
+
+    /// An export section exporting function `index` under `name`.
+    fn export_func(name: &str, index: u32) -> Vec<u8> {
+        let mut payload = vec![0x01]; // one export
+        payload.push(name.len() as u8);
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0x00); // ExternalKind::Func
+        payload.extend_from_slice(&leb(index));
+        let mut b = vec![0x07]; // export section id
+        b.extend_from_slice(&leb(payload.len() as u32));
+        b.extend_from_slice(&payload);
+        b
+    }
+
+    /// A start section naming function `index`.
+    fn start_section(index: u32) -> Vec<u8> {
+        let payload = leb(index);
+        let mut b = vec![0x08]; // start section id
+        b.extend_from_slice(&leb(payload.len() as u32));
+        b.extend_from_slice(&payload);
+        b
+    }
+
+    /// Build a module with the given imports, defined-function bodies, exports
+    /// (`(name, function index)`), and optional start function index. Sections
+    /// are emitted in canonical order.
+    fn module_with_graph(
+        imports: &[&str],
+        bodies: &[Vec<u8>],
+        exports: &[(&str, u32)],
+        start: Option<u32>,
+    ) -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        if !imports.is_empty() {
+            b.extend_from_slice(&import_section(imports));
+        }
+        b.extend_from_slice(&function_section(bodies.len()));
+        for (name, idx) in exports {
+            b.extend_from_slice(&export_func(name, *idx));
+        }
+        if let Some(s) = start {
+            b.extend_from_slice(&start_section(s));
+        }
+        let mut payload = vec![bodies.len() as u8];
+        for body in bodies {
+            payload.push(body.len() as u8);
+            payload.extend_from_slice(body);
+        }
+        let mut code = vec![0x0a];
+        code.extend_from_slice(&leb(payload.len() as u32));
+        code.extend_from_slice(&payload);
+        b.extend_from_slice(&code);
+        b
+    }
+
+    // --- Reachability tests ---
+
+    #[test]
+    fn reachability_absent_when_no_defined_functions() {
+        // No defined functions: nothing to analyse, field omitted entirely.
+        let wasm = module_with_graph(&["imp"], &[], &[], None);
+        let report = inspect(&wasm, false).unwrap();
+        assert!(report.reachability.is_none());
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            value.get("reachability").is_none(),
+            "reachability must be omitted when there are no defined functions"
+        );
+    }
+
+    #[test]
+    fn reachability_export_is_a_root() {
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[("entry", 0)], None);
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.roots.len(), 1);
+        assert_eq!(r.roots[0].kind, "export");
+        assert_eq!(r.roots[0].name.as_deref(), Some("entry"));
+        assert_eq!(r.roots[0].function_index, 0);
+        assert_eq!(r.roots[0].resolution, "defined");
+        assert_eq!(r.roots[0].defined_index, Some(0));
+        assert_eq!(r.reachable_defined, vec![0]);
+        assert!(r.unreachable_defined.is_empty());
+    }
+
+    #[test]
+    fn reachability_start_is_a_root() {
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[], Some(0));
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.roots.len(), 1);
+        assert_eq!(r.roots[0].kind, "start");
+        assert!(
+            r.roots[0].name.is_none(),
+            "start roots carry no export name"
+        );
+        assert_eq!(r.roots[0].resolution, "defined");
+        assert_eq!(r.reachable_defined, vec![0]);
+    }
+
+    #[test]
+    fn reachability_start_ranks_before_exports() {
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[("e", 0)], Some(0));
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.roots.len(), 2);
+        assert_eq!(r.roots[0].kind, "start", "start is ordered first");
+        assert_eq!(r.roots[1].kind, "export");
+    }
+
+    #[test]
+    fn reachability_transitive_direct_calls() {
+        // Defined 0 calls 1; defined 1 calls 2. Root = export of defined 0.
+        let wasm = module_with_graph(
+            &[],
+            &[
+                body_with_ops(&[0x10, 0x01]), // call 1
+                body_with_ops(&[0x10, 0x02]), // call 2
+                body_with_ops(&[]),
+            ],
+            &[("entry", 0)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.reachable_defined, vec![0, 1, 2], "transitive closure");
+        assert!(r.unreachable_defined.is_empty());
+    }
+
+    #[test]
+    fn reachability_imports_first_indexing() {
+        // 1 import (index 0) + 2 defined (indices 1, 2). Defined 0 calls the
+        // import and defined 1. Root = export of defined 0 (index 1).
+        let wasm = module_with_graph(
+            &["host_fn"],
+            &[
+                body_with_ops(&[0x10, 0x00, 0x10, 0x02]), // call 0 (import), call 2 (defined 1)
+                body_with_ops(&[]),
+            ],
+            &[("entry", 1)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.roots[0].function_index, 1, "export names raw index 1");
+        assert_eq!(r.roots[0].defined_index, Some(0));
+        assert_eq!(
+            r.reachable_defined,
+            vec![0, 1],
+            "import at index 0 is not a defined function"
+        );
+        assert!(r.unreachable_defined.is_empty());
+    }
+
+    #[test]
+    fn reachability_imported_export_root_is_not_traversed() {
+        // Exporting an imported function makes it a root, but it has no body
+        // in this module, so no defined function becomes reachable through it.
+        let wasm = module_with_graph(
+            &["host_fn"],
+            &[body_with_ops(&[])], // defined 0, unreached
+            &[("host", 0)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.roots[0].resolution, "imported");
+        assert!(r.roots[0].defined_index.is_none());
+        assert!(r.reachable_defined.is_empty());
+        assert_eq!(r.unreachable_defined, vec![0]);
+    }
+
+    #[test]
+    fn reachability_unreachable_defined_functions_reported() {
+        // 3 defined functions, only 0 exported and it makes no calls.
+        let wasm = module_with_graph(
+            &[],
+            &[body_with_ops(&[]), body_with_ops(&[]), body_with_ops(&[])],
+            &[("entry", 0)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.reachable_defined, vec![0]);
+        assert_eq!(r.unreachable_defined, vec![1, 2]);
+    }
+
+    #[test]
+    fn reachability_invalid_root_index_is_safe() {
+        // Export names index 99, which no function occupies.
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[("bogus", 99)], None);
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.roots[0].resolution, "invalid");
+        assert!(r.roots[0].defined_index.is_none());
+        assert!(r.reachable_defined.is_empty());
+        assert_eq!(r.unreachable_defined, vec![0]);
+    }
+
+    #[test]
+    fn reachability_invalid_call_target_does_not_panic() {
+        // Defined 0 calls index 99 (invalid) and index 1 (defined).
+        let wasm = module_with_graph(
+            &[],
+            &[
+                body_with_ops(&[0x10, 0x63, 0x10, 0x01]), // call 99, call 1
+                body_with_ops(&[]),
+            ],
+            &[("entry", 0)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(
+            r.reachable_defined,
+            vec![0, 1],
+            "invalid target is skipped, valid edge still followed"
+        );
+    }
+
+    #[test]
+    fn reachability_json_is_deterministic() {
+        let build = || {
+            module_with_graph(
+                &["host_fn"],
+                &[
+                    body_with_ops(&[0x10, 0x01, 0x10, 0x02]),
+                    body_with_ops(&[]),
+                    body_with_ops(&[]),
+                ],
+                &[("entry", 1), ("aux", 2)],
+                Some(1),
+            )
+        };
+        let first = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        let second = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        assert_eq!(first, second, "reachability JSON must be deterministic");
+    }
+
+    #[test]
+    fn reachability_json_omits_empty_arrays() {
+        // One defined function, exported: reachable=[0], unreachable empty.
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[("entry", 0)], None);
+        let report = inspect(&wasm, false).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let r = &value["reachability"];
+        assert!(r.get("reachable_defined").is_some());
+        assert!(
+            r.get("unreachable_defined").is_none(),
+            "empty unreachable list must be omitted"
+        );
+    }
+
+    #[test]
+    fn reachability_json_is_backward_compatible() {
+        // Adding reachability must not disturb pre-existing keys. Only keys
+        // that `inspect` always emits are asserted; `structure` and `analysis`
+        // are legitimately omitted when empty/absent.
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[("entry", 0)], None);
+        let report = inspect(&wasm, false).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for key in [
+            "size_bytes",
+            "imports",
+            "exports",
+            "custom_sections",
+            "functions",
+            "code_body_metrics",
+            "interface",
+        ] {
+            assert!(value.get(key).is_some(), "pre-existing key {key} survives");
+        }
+        assert!(value.get("reachability").is_some(), "new key present");
+    }
+
+    #[test]
+    fn reachability_self_recursive_function_is_reached() {
+        // A function that calls itself must not loop forever.
+        let wasm = module_with_graph(
+            &[],
+            &[body_with_ops(&[0x10, 0x00])], // call 0 (itself)
+            &[("entry", 0)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let r = report.reachability.expect("reachability present");
+        assert_eq!(r.reachable_defined, vec![0]);
+    }
+
+    // --- Consolidated summary tests ---
+
+    #[test]
+    fn summary_empty_module_is_all_zeros_with_optional_parts_omitted() {
+        let wasm = module_with_graph(&[], &[], &[], None);
+        let report = inspect(&wasm, false).unwrap();
+        let s = &report.summary;
+        assert_eq!(s.imported_function_count, 0);
+        assert_eq!(s.exported_function_count, 0);
+        assert_eq!(s.defined_function_count, 0);
+        assert_eq!(s.total_function_count, 0);
+        assert_eq!(s.total_body_bytes, 0);
+        assert_eq!(s.total_operator_count, 0);
+        assert_eq!(s.total_local_count, 0);
+        assert_eq!(s.custom_section_count, 0);
+        assert!(!s.has_contract_spec);
+        assert!(
+            s.structure.is_none(),
+            "structure absent: unavailable, not zero"
+        );
+        assert!(
+            s.reachability.is_none(),
+            "reachability absent: unavailable, not zero"
+        );
+        assert!(s.instruction_family_totals.is_empty());
+        // The JSON must omit the unavailable sub-objects rather than emit them
+        // as zeros.
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let s = &value["summary"];
+        assert!(
+            s.get("structure").is_none(),
+            "unavailable structure omitted"
+        );
+        assert!(
+            s.get("reachability").is_none(),
+            "unavailable reachability omitted"
+        );
+        assert!(s.get("instruction_family_totals").is_none());
+    }
+
+    #[test]
+    fn summary_counts_populated_module() {
+        // 1 import + 2 defined, 1 export, 1 custom section, a start section.
+        let wasm = module_with_graph(
+            &["host_fn"],
+            &[
+                body_with_ops(&[0x01]), // nop
+                body_with_ops(&[]),
+            ],
+            &[("entry", 1)],
+            Some(1),
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let s = &report.summary;
+        assert_eq!(s.imported_function_count, 1);
+        assert_eq!(s.exported_function_count, 1);
+        assert_eq!(s.defined_function_count, 2);
+        assert_eq!(s.total_function_count, 3, "imports + defined");
+        assert_eq!(s.total_body_bytes, 5, "body bytes summed over both bodies");
+        assert_eq!(s.total_operator_count, 1, "one nop across the module");
+        assert_eq!(s.total_local_count, 0);
+        assert_eq!(s.custom_section_count, 0);
+
+        let st = s
+            .structure
+            .as_ref()
+            .expect("structure present (start section)");
+        assert!(st.has_start_function);
+        assert_eq!(st.memory_count, 0);
+
+        let r = s.reachability.as_ref().expect("reachability present");
+        assert_eq!(r.root_count, 2, "start + export");
+        assert_eq!(r.reachable_defined_count, 1, "only defined 0 is a root");
+        assert_eq!(r.unreachable_defined_count, 1);
+    }
+
+    #[test]
+    fn summary_mirrors_reachability_and_structure_consistently() {
+        let wasm = module_with_graph(
+            &[],
+            &[
+                body_with_ops(&[0x10, 0x01]),
+                body_with_ops(&[]),
+                body_with_ops(&[]),
+            ],
+            &[("entry", 0)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let s = &report.summary;
+        let r = s.reachability.as_ref().expect("reachability present");
+        let r_full = report.reachability.as_ref().expect("reachability present");
+        assert_eq!(r.root_count, r_full.roots.len());
+        assert_eq!(r.reachable_defined_count, r_full.reachable_defined.len());
+        assert_eq!(
+            r.unreachable_defined_count,
+            r_full.unreachable_defined.len()
+        );
+        // The two lists must partition the defined functions exactly.
+        assert_eq!(
+            r.reachable_defined_count + r.unreachable_defined_count,
+            s.defined_function_count
+        );
+    }
+
+    #[test]
+    fn summary_instruction_family_totals_sum_to_operator_total() {
+        let wasm = module_with_graph(
+            &[],
+            &[
+                body_with_ops(&[0x01, 0x6a, 0x10, 0x01]), // nop, add, call
+                body_with_ops(&[0x01]),                   // nop
+            ],
+            &[("entry", 0)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let s = &report.summary;
+        let family_sum: usize = s.instruction_family_totals.values().sum();
+        assert_eq!(
+            family_sum, s.total_operator_count,
+            "family totals must sum to the operator total"
+        );
+        // Both bodies emit the "misc" family from their nop.
+        assert_eq!(s.instruction_family_totals.get("misc"), Some(&2));
+        assert_eq!(s.instruction_family_totals.get("numeric"), Some(&1));
+        assert_eq!(s.instruction_family_totals.get("call"), Some(&1));
+    }
+
+    #[test]
+    fn summary_has_contract_spec_mirrors_interface() {
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[("entry", 0)], None);
+        let mut report = inspect(&wasm, false).unwrap();
+        assert!(!report.summary.has_contract_spec);
+        assert_eq!(
+            report.summary.has_contract_spec,
+            report.interface.as_ref().unwrap().has_contract_spec,
+            "summary must agree with the interface flag"
+        );
+        // Simulate a contract spec section and re-derive: the flag follows.
+        report.custom_sections.push(CustomSection {
+            name: "contractspecv0".to_string(),
+            len_bytes: 0,
+        });
+        report.interface = Some(build_interface_summary(&report));
+        report.summary = build_analysis_summary(&report).unwrap();
+        assert!(report.summary.has_contract_spec);
+        assert_eq!(
+            report.summary.custom_section_count, 1,
+            "custom section count mirrors custom_sections.len()"
+        );
+    }
+
+    #[test]
+    fn summary_analysis_finding_count_absent_without_analysis() {
+        // The library-level `inspect` does not run `analysis`, so the summary
+        // must report the field as unavailable rather than as a zero.
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[("entry", 0)], None);
+        let report = inspect(&wasm, false).unwrap();
+        assert!(report.analysis.is_none());
+        assert!(
+            report.summary.analysis_finding_count.is_none(),
+            "unavailable analysis is omitted, not reported as zero"
+        );
+    }
+
+    #[test]
+    fn summary_analysis_finding_count_present_with_analysis() {
+        let wasm = module_with_graph(&[], &[body_with_ops(&[])], &[("entry", 0)], None);
+        let mut report = inspect(&wasm, false).unwrap();
+        assert!(report.summary.analysis_finding_count.is_none());
+        report.analysis = Some(analyze(&wasm).unwrap());
+        report.summary = build_analysis_summary(&report).unwrap();
+        let expected = report.analysis.as_ref().unwrap().findings.len();
+        assert_eq!(
+            report.summary.analysis_finding_count,
+            Some(expected),
+            "summary reflects the attached analysis"
+        );
+    }
+
+    #[test]
+    fn summary_json_is_deterministic() {
+        let build = || {
+            module_with_graph(
+                &["host_fn"],
+                &[body_with_ops(&[0x01]), body_with_ops(&[])],
+                &[("entry", 1)],
+                Some(1),
+            )
+        };
+        let first = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        let second = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        assert_eq!(first, second, "summary JSON must be deterministic");
+    }
+
+    #[test]
+    fn summary_json_is_additive_and_sorted() {
+        let wasm = module_with_graph(
+            &["host_fn"],
+            &[body_with_ops(&[0x01, 0x6a]), body_with_ops(&[])],
+            &[("entry", 1)],
+            None,
+        );
+        let report = inspect(&wasm, false).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for key in [
+            "size_bytes",
+            "imports",
+            "exports",
+            "custom_sections",
+            "functions",
+            "code_body_metrics",
+            "reachability",
+            "interface",
+            "summary",
+        ] {
+            assert!(value.get(key).is_some(), "key {key} present");
+        }
+        // The family map is a BTreeMap, so its JSON keys are sorted.
+        let s = &value["summary"]["instruction_family_totals"];
+        let keys: Vec<&str> = s.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "family totals must be sorted");
+    }
+
+    #[test]
+    fn summary_omits_optional_parts_not_fills_them_with_zero() {
+        // A minimal module: no structure, no reachability. The sub-objects must
+        // be absent from JSON, not present as all-zero objects.
+        let wasm = module_with_graph(&[], &[], &[], None);
+        let report = inspect(&wasm, false).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let s = &value["summary"];
+        assert!(s.get("structure").is_none());
+        assert!(s.get("reachability").is_none());
+        assert!(s.get("analysis_finding_count").is_none());
+        // Genuine zeros are still emitted for the always-available counts.
+        assert_eq!(s["total_function_count"], 0);
+        assert_eq!(s["has_contract_spec"], false);
+    }
+
+    #[test]
+    fn call_graph_no_calls() {
+        let wasm = module_with_bodies(&[body_with_ops(&[0x01])]); // nop
+        let report = inspect(&wasm, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert!(m.direct_calls.is_empty());
+        assert_eq!(m.indirect_call_sites, 0);
+        assert_eq!(m.reference_call_sites, 0);
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entry = &value["code_body_metrics"][0];
+        assert!(entry.get("direct_calls").is_none(), "empty edges omitted");
+        assert!(
+            entry.get("indirect_call_sites").is_none(),
+            "zero counter omitted"
+        );
+    }
+
+    #[test]
+    fn call_graph_direct_call_to_defined() {
+        // Two defined functions (indices 0 and 1). Function 0 calls 1.
+        let wasm = module_with_bodies(&[
+            body_with_ops(&[0x10, 0x01]), // call 1
+            body_with_ops(&[]),
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.direct_calls.len(), 1);
+        let edge = &m.direct_calls[0];
+        assert_eq!(edge.callee_index, 1);
+        assert_eq!(edge.call_count, 1);
+        match &edge.resolution {
+            CallTargetResolution::Defined { defined_index, .. } => {
+                assert_eq!(*defined_index, 1);
+            }
+            other => panic!("expected Defined, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_graph_direct_call_to_imported() {
+        // One imported function (index 0) + one defined (index 1) that
+        // calls the import.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&import_section(&["ext_fn"]));
+        b.extend_from_slice(&function_section(1));
+        let body = body_with_ops(&[0x10, 0x00]); // call 0
+        let mut payload = vec![0x01, body.len() as u8];
+        payload.extend_from_slice(&body);
+        b.push(0x0a);
+        b.extend_from_slice(&leb(payload.len() as u32));
+        b.extend_from_slice(&payload);
+        let report = inspect(&b, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.function_index, 1, "defined function follows the import");
+        assert_eq!(m.direct_calls.len(), 1);
+        let edge = &m.direct_calls[0];
+        assert_eq!(edge.callee_index, 0);
+        match &edge.resolution {
+            CallTargetResolution::Imported { module, name } => {
+                assert_eq!(module, "env");
+                assert_eq!(name, "ext_fn");
+            }
+            other => panic!("expected Imported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_graph_duplicate_calls_are_aggregated() {
+        // Three call sites to the same callee collapse into one edge.
+        let wasm = module_with_bodies(&[
+            body_with_ops(&[
+                0x10, 0x01, // call 1
+                0x10, 0x01, // call 1
+                0x10, 0x01, // call 1
+            ]),
+            body_with_ops(&[]),
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.direct_calls.len(), 1, "distinct callees, not sites");
+        assert_eq!(m.direct_calls[0].callee_index, 1);
+        assert_eq!(m.direct_calls[0].call_count, 3);
+    }
+
+    #[test]
+    fn call_graph_edges_sorted_by_callee() {
+        // Calls out of order: 2, then 0, then 1. Edges must come out sorted.
+        let wasm = module_with_bodies(&[
+            body_with_ops(&[
+                0x10, 0x02, // call 2
+                0x10, 0x00, // call 0
+                0x10, 0x01, // call 1
+            ]),
+            body_with_ops(&[]),
+            body_with_ops(&[]),
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        let idxs: Vec<u32> = m.direct_calls.iter().map(|e| e.callee_index).collect();
+        assert_eq!(idxs, vec![0, 1, 2], "edges sorted by callee index");
+    }
+
+    #[test]
+    fn call_graph_indirect_calls_have_no_invented_target() {
+        // call_indirect (0x11 0x00 0x00) names a type, not a target.
+        let wasm = module_with_bodies(&[body_with_ops(&[0x11, 0x00, 0x00])]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert!(m.direct_calls.is_empty(), "no edge invented");
+        assert_eq!(m.indirect_call_sites, 1);
+    }
+
+    #[test]
+    fn call_graph_unresolved_callee_is_invalid_not_panicking() {
+        // call 99 names no function in a one-function module.
+        let wasm = module_with_bodies(&[body_with_ops(&[0x10, 0x63])]); // call 99
+        let report = inspect(&wasm, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.direct_calls.len(), 1);
+        assert_eq!(m.direct_calls[0].callee_index, 99);
+        assert_eq!(m.direct_calls[0].resolution, CallTargetResolution::Invalid);
+    }
+
+    #[test]
+    fn call_graph_json_is_deterministic() {
+        let build = || {
+            module_with_bodies(&[
+                body_with_ops(&[0x10, 0x01, 0x10, 0x02, 0x10, 0x01]),
+                body_with_ops(&[0x11, 0x00, 0x00]),
+                body_with_ops(&[]),
+            ])
+        };
+        let first = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        let second = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        assert_eq!(first, second, "call-graph JSON must be deterministic");
+    }
+
+    #[test]
+    fn call_graph_resolution_survives_imports_before_defined() {
+        // 2 imports (indices 0, 1) + 2 defined (indices 2, 3).
+        // Defined function 0 calls index 1 (import) and index 3 (defined 1).
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&import_section(&["imp_a", "imp_b"]));
+        b.extend_from_slice(&function_section(2));
+        let b0 = body_with_ops(&[0x10, 0x01, 0x10, 0x03]);
+        let b1 = body_with_ops(&[]);
+        let mut payload = vec![0x02, b0.len() as u8];
+        payload.extend_from_slice(&b0);
+        payload.push(b1.len() as u8);
+        payload.extend_from_slice(&b1);
+        b.push(0x0a);
+        b.extend_from_slice(&leb(payload.len() as u32));
+        b.extend_from_slice(&payload);
+        let report = inspect(&b, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.function_index, 2);
+        assert_eq!(m.direct_calls.len(), 2);
+
+        assert_eq!(m.direct_calls[0].callee_index, 1);
+        match &m.direct_calls[0].resolution {
+            CallTargetResolution::Imported { name, .. } => assert_eq!(name, "imp_b"),
+            other => panic!("expected Imported imp_b, got {other:?}"),
+        }
+
+        assert_eq!(m.direct_calls[1].callee_index, 3);
+        match &m.direct_calls[1].resolution {
+            CallTargetResolution::Defined { defined_index, .. } => {
+                assert_eq!(*defined_index, 1, "index 3 is the second defined function");
+            }
+            other => panic!("expected Defined, got {other:?}"),
+        }
     }
 }
