@@ -4,6 +4,7 @@
 //! so malformed/truncated input surfaces as typed errors instead of panics.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io;
 use wasmparser::{CoreType, Parser, Payload, RecGroup, TypeRef, Validator, WasmFeatures};
 
@@ -18,8 +19,1460 @@ pub struct WasmReport {
     pub exports: Vec<ExportEntry>,
     /// Custom sections found in the module (name + byte length).
     pub custom_sections: Vec<CustomSection>,
+    /// Per-section details in declaration order: index, name, payload length,
+    /// and classification. Empty when there are no custom sections.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_section_details: Vec<CustomSectionDetail>,
     /// Function signatures declared locally (index → params/results).
     pub functions: Vec<FunctionSig>,
+    /// Per-defined-function body metrics, in function-section declaration order.
+    /// Empty when the module has no defined functions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_body_metrics: Vec<CodeBodyMetrics>,
+    /// Module-level structural summary (memories, tables, globals, segments, start).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structure: Option<ModuleStructure>,
+    /// Resource + compatibility analysis (populated by `inspect` command only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<Analysis>,
+    /// Developer-facing interface overview, derived from the resolved
+    /// `imports`/`exports` above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<InterfaceSummary>,
+}
+
+/// Developer-facing overview of a module's public interface and external
+/// dependencies.
+///
+/// Every field is derived from the already-resolved `imports`/`exports`
+/// vectors — this summary never reparses the module and never re-does index
+/// resolution. Ordering is deterministic: grouped counts are sorted by kind
+/// name, per-entry lists keep declaration order.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct InterfaceSummary {
+    /// Import counts grouped by kind, sorted by kind name.
+    pub imports_by_kind: Vec<KindCount>,
+    /// Export counts grouped by kind, sorted by kind name.
+    pub exports_by_kind: Vec<KindCount>,
+    /// Exported functions in declaration order. `signature` is null when the
+    /// type was not resolvable — unavailable, never guessed.
+    pub exported_functions: Vec<ExportedFunction>,
+    /// Imported functions in import order.
+    pub imported_functions: Vec<ImportedFunction>,
+    /// Every export name with its resource kind, in declaration order.
+    pub exports: Vec<ExportNameKind>,
+    /// `true` when a `contractspecv0` custom section is present.
+    ///
+    /// Contract-spec functions are an ABI view reported by `validate`. They
+    /// are deliberately NOT merged into `exported_functions`, which lists raw
+    /// WASM exports only. The two are different views and must not be
+    /// conflated.
+    pub has_contract_spec: bool,
+}
+
+/// A count of entries sharing one resource kind.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct KindCount {
+    pub kind: String,
+    pub count: usize,
+}
+
+/// An exported function: its export name plus the signature of the function
+/// it refers to, or `null` when that signature could not be resolved.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExportedFunction {
+    pub name: String,
+    /// Exported WASM function index.
+    pub index: u32,
+    /// Rendered signature, or `null` when unresolvable.
+    pub signature: Option<String>,
+}
+
+/// An imported function: module/name plus its signature when resolvable.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImportedFunction {
+    pub module: String,
+    pub name: String,
+    /// Rendered signature, or `null` when unresolvable.
+    pub signature: Option<String>,
+}
+
+/// An export name paired with its resource kind.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExportNameKind {
+    pub name: String,
+    pub kind: String,
+}
+
+/// Counts and key details of the module's linear-memory, table, global, and
+/// segment structure. Present only when the module declares such items.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct StartFunction {
+    /// Index from the start section (WASM function index space: imported
+    /// functions come first, then defined).
+    pub index: u32,
+    /// `"imported"` when the index resolves to an imported function,
+    /// `"defined"` when it resolves to a locally defined function, or
+    /// `"invalid"` when no function occupies that index.
+    pub resolution: String,
+    /// Module and import name, present only when `resolution == "imported"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<ImportRef>,
+    /// Signature and declared-function index, present only when
+    /// `resolution == "defined"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<StartFunctionSig>,
+}
+
+/// A back-reference from a resolved index to the import that owns it.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImportRef {
+    pub module: String,
+    pub name: String,
+}
+
+/// The signature of a resolved start function, plus its position in the
+/// module's declared (defined-only) function list.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct StartFunctionSig {
+    pub declared_index: u32,
+    pub signature: String,
+}
+
+/// A data segment's mode, as represented by the parser.
+///
+/// wasmparser 0.121.2 exposes only two variants for data segments
+/// (`DataKind::Passive` and `DataKind::Active`); the reference-interpreter
+/// "declared" form has no representation here, so it is never emitted.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataSegmentMode {
+    Active,
+    Passive,
+}
+
+/// The offset expression of an active data segment, represented
+/// conservatively.
+///
+/// Only constant forms the parser can evaluate without guessing are
+/// reported as a value. Anything else — a global reference, a non-constant
+/// operator, or a malformed expression — is reported as
+/// `OffsetExpr::Unsupported` with the reason, never as an invented number.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OffsetExpr {
+    /// A single `i32.const` / `i64.const` instruction.
+    Const { value: i64 },
+    /// A single `global.get` instruction; the referenced global's value is
+    /// not evaluated here.
+    GlobalGet { global_index: u32 },
+    /// Any other form, with the reason it could not be represented.
+    Unsupported { reason: String },
+}
+
+/// One data segment, in declaration order.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct DataSegment {
+    /// 0-based position in the data section (declaration order).
+    pub index: usize,
+    /// Active or passive, as parsed.
+    pub mode: DataSegmentMode,
+    /// Memory index for active segments; absent for passive segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_index: Option<u32>,
+    /// Offset expression for active segments; absent for passive segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<OffsetExpr>,
+    /// Payload length in bytes. The payload itself is never emitted.
+    pub payload_len: usize,
+}
+
+/// Classify a constant expression conservatively.
+///
+/// Returns `Ok(OffsetExpr)` for the single-instruction forms that can be
+/// represented without evaluating anything, and `Err(reason)` for anything
+/// else. The caller converts the error into `OffsetExpr::Unsupported`.
+///
+/// Deliberately conservative: a `global.get` is reported as a reference, not
+/// as the global's value, because this tool does not evaluate globals.
+fn classify_const_expr(expr: &wasmparser::ConstExpr<'_>) -> Result<OffsetExpr, String> {
+    use wasmparser::Operator;
+    let mut reader = expr.get_operators_reader();
+    let mut ops: Vec<Operator<'_>> = Vec::new();
+    loop {
+        match reader.read() {
+            Ok(op) => ops.push(op),
+            Err(e) => return Err(format!("unparseable offset expression: {e}")),
+        }
+        if matches!(ops.last(), Some(Operator::End)) {
+            break;
+        }
+    }
+    // A constant expression is exactly one instruction plus `End`.
+    let body = &ops[..ops.len() - 1];
+    match body {
+        [Operator::I32Const { value }] => Ok(OffsetExpr::Const {
+            value: i64::from(*value),
+        }),
+        [Operator::I64Const { value }] => Ok(OffsetExpr::Const { value: *value }),
+        [Operator::GlobalGet { global_index }] => Ok(OffsetExpr::GlobalGet {
+            global_index: *global_index,
+        }),
+        [] => Err("empty offset expression".to_string()),
+        _ => Err(format!(
+            "unsupported constant expression with {} instruction(s)",
+            body.len()
+        )),
+    }
+}
+
+/// An element segment's mode, as represented by the parser.
+///
+/// wasmparser 0.121.2 exposes three variants for element segments
+/// (`ElementKind::Passive`, `ElementKind::Active`, and `ElementKind::Declared`),
+/// so all three are represented here.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementSegmentMode {
+    Active,
+    Passive,
+    Declared,
+}
+
+/// The element kind of an element segment.
+///
+/// wasmparser 0.121.2 reports this as `ElementItems::Functions` (a vector of
+/// function indices) or `ElementItems::Expressions` (a vector of constant
+/// expressions plus their reference type), so both are represented here.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementKind {
+    /// The segment carries function indices.
+    Functions,
+    /// The segment carries reference expressions of the given reference type.
+    Expressions { element_type: String },
+}
+
+/// One element of a function-index element segment.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ElementFuncIndex {
+    /// 0-based position within the segment's element list.
+    pub item_index: usize,
+    /// The raw function index as declared in the segment.
+    pub raw_index: u32,
+    /// Resolution against the full function index space: imported functions
+    /// occupy the lowest indices, then locally defined functions.
+    pub resolution: ElementRefResolution,
+}
+
+/// How one element-segment reference resolved against the module's function
+/// index space.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementRefResolution {
+    /// Resolves to an imported function; carries the import's module and name.
+    Imported { module: String, name: String },
+    /// Resolves to a locally defined function; carries its 0-based position
+    /// among defined functions and its rendered signature.
+    Defined {
+        declared_index: u32,
+        signature: String,
+    },
+    /// The index names no function in this module's index space. Reported
+    /// rather than dropped or panicked on.
+    Invalid,
+}
+
+/// One element of a reference-expression element segment.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ElementExprItem {
+    /// 0-based position within the segment's element list.
+    pub item_index: usize,
+    /// The reference type of the expression, as reported by the parser.
+    pub element_type: String,
+    /// How the expression was classified.
+    pub expr: ElementExpr,
+}
+
+/// A conservative representation of one reference expression.
+///
+/// Only the forms the parser can represent without evaluating anything are
+/// reported; anything else is `Unsupported` with a reason, never an invented
+/// value.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementExpr {
+    /// A single `ref.func <index>` instruction. The index is preserved raw and
+    /// resolved against the full function index space.
+    RefFunc {
+        raw_index: u32,
+        resolution: ElementRefResolution,
+    },
+    /// A single `ref.null <heap_type>` instruction.
+    RefNull { heap_type: String },
+    /// Any other form, with the reason it could not be represented.
+    Unsupported { reason: String },
+}
+
+/// Classify one reference expression conservatively.
+///
+/// Returns `Ok(ElementExpr)` for the single-instruction forms that can be
+/// represented without evaluating anything, and `Err(reason)` for anything
+/// else. The caller converts the error into `ElementExpr::Unsupported`.
+///
+/// Deliberately conservative: a `ref.func` is reported as a reference with its
+/// raw index, never as a resolved function name, because this tool does not
+/// evaluate expressions.
+fn classify_element_expr(expr: &wasmparser::ConstExpr<'_>) -> Result<ElementExpr, String> {
+    use wasmparser::Operator;
+    let mut reader = expr.get_operators_reader();
+    let mut ops: Vec<Operator<'_>> = Vec::new();
+    loop {
+        match reader.read() {
+            Ok(op) => ops.push(op),
+            Err(e) => return Err(format!("unparseable element expression: {e}")),
+        }
+        if matches!(ops.last(), Some(Operator::End)) {
+            break;
+        }
+    }
+    // A constant expression is exactly one instruction plus `End`.
+    let body = &ops[..ops.len() - 1];
+    match body {
+        [Operator::RefFunc { function_index }] => Ok(ElementExpr::RefFunc {
+            raw_index: *function_index,
+            resolution: ElementRefResolution::Invalid,
+        }),
+        [Operator::RefNull { hty }] => Ok(ElementExpr::RefNull {
+            heap_type: format!("{hty:?}"),
+        }),
+        [] => Err("empty element expression".to_string()),
+        _ => Err(format!(
+            "unsupported element expression with {} instruction(s)",
+            body.len()
+        )),
+    }
+}
+
+/// One element segment, in declaration order.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ElementSegment {
+    /// 0-based position in the element section (declaration order).
+    pub index: usize,
+    /// Active, passive, or declared, as parsed.
+    pub mode: ElementSegmentMode,
+    /// Table index for active segments; absent for passive and declared
+    /// segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_index: Option<u32>,
+    /// Offset expression for active segments; absent for passive and declared
+    /// segments. Reuses the conservative representation from data segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<OffsetExpr>,
+    /// Function indices or reference expressions, as parsed.
+    pub kind: ElementKind,
+    /// Number of elements in the segment.
+    pub element_count: usize,
+    /// Per-element detail. Empty for segments whose items could not be
+    /// classified. Never contains raw payload bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<ElementItem>,
+}
+
+/// One element of an element segment, in declaration order.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ElementItem {
+    /// A function index, resolved against the full function index space.
+    FuncIndex(ElementFuncIndex),
+    /// A reference expression.
+    Expr(ElementExprItem),
+}
+
+/// An element segment as parsed, before function-index resolution.
+///
+/// Function indices are kept raw here and resolved after the whole payload
+/// loop, because resolution needs the complete function index space (imported
+/// functions first, then locally defined functions).
+#[derive(Debug)]
+struct RawElementSegment {
+    index: usize,
+    mode: ElementSegmentMode,
+    table_index: Option<u32>,
+    offset: Option<OffsetExpr>,
+    kind: ElementKind,
+    element_count: usize,
+    /// Raw function indices for `ElementKind::Functions`, in declaration order.
+    func_indices: Vec<u32>,
+    /// Classified reference expressions for `ElementKind::Expressions`, in
+    /// declaration order.
+    exprs: Vec<ElementExpr>,
+}
+
+/// Parse one element segment into its raw (unresolved) form.
+///
+/// Never serializes the raw payload: only the count and the classified items
+/// are retained. Unparseable items become `ElementExpr::Unsupported` with a
+/// reason rather than being dropped or panicking.
+fn parse_element_segment(index: usize, seg: wasmparser::Element<'_>) -> RawElementSegment {
+    let (mode, table_index, offset) = match seg.kind {
+        wasmparser::ElementKind::Passive => (ElementSegmentMode::Passive, None, None),
+        wasmparser::ElementKind::Declared => (ElementSegmentMode::Declared, None, None),
+        wasmparser::ElementKind::Active {
+            table_index,
+            offset_expr,
+        } => {
+            let offset = match classify_const_expr(&offset_expr) {
+                Ok(expr) => expr,
+                Err(reason) => OffsetExpr::Unsupported { reason },
+            };
+            // `table_index` is `None` for the implicit table 0 encoding
+            // (flags 0x00), which the parser normalizes to table 0.
+            (
+                ElementSegmentMode::Active,
+                Some(table_index.unwrap_or(0)),
+                Some(offset),
+            )
+        }
+    };
+
+    match seg.items {
+        wasmparser::ElementItems::Functions(funcs) => {
+            let mut func_indices = Vec::new();
+            for f in funcs {
+                // A malformed item is reported as an unresolved reference
+                // (u32::MAX never names a function) rather than aborting the
+                // whole segment.
+                func_indices.push(f.unwrap_or(u32::MAX));
+            }
+            let element_count = func_indices.len();
+            RawElementSegment {
+                index,
+                mode,
+                table_index,
+                offset,
+                kind: ElementKind::Functions,
+                element_count,
+                func_indices,
+                exprs: Vec::new(),
+            }
+        }
+        wasmparser::ElementItems::Expressions(ty, exprs) => {
+            let element_type = format!("{ty:?}");
+            let mut classified = Vec::new();
+            for e in exprs {
+                match e {
+                    Ok(expr) => match classify_element_expr(&expr) {
+                        Ok(classified_expr) => classified.push(classified_expr),
+                        Err(reason) => classified.push(ElementExpr::Unsupported { reason }),
+                    },
+                    Err(e) => classified.push(ElementExpr::Unsupported {
+                        reason: format!("unparseable element expression: {e}"),
+                    }),
+                }
+            }
+            let element_count = classified.len();
+            RawElementSegment {
+                index,
+                mode,
+                table_index,
+                offset,
+                kind: ElementKind::Expressions { element_type },
+                element_count,
+                func_indices: Vec::new(),
+                exprs: classified,
+            }
+        }
+    }
+}
+
+/// Resolve a raw element segment against the module's function index space.
+///
+/// Imported functions occupy the lowest indices, then locally defined
+/// functions in declaration order. An index that names no function resolves
+/// to `ElementRefResolution::Invalid` — reported, never dropped or panicked.
+fn resolve_element_segment(
+    raw: RawElementSegment,
+    imported_func_type_idx: &[u32],
+    func_type_idx: &[u32],
+    imports: &[ImportEntry],
+    types: &[String],
+) -> ElementSegment {
+    let imported_func_count = imported_func_type_idx.len();
+
+    let resolve_index = |raw_index: u32| -> ElementRefResolution {
+        let i = raw_index as usize;
+        if i < imported_func_count {
+            // Resolves to an imported function: report which import.
+            let mut count = 0usize;
+            for imp in imports {
+                if imp.kind == "function" {
+                    if count == i {
+                        return ElementRefResolution::Imported {
+                            module: imp.module.clone(),
+                            name: imp.name.clone(),
+                        };
+                    }
+                    count += 1;
+                }
+            }
+            ElementRefResolution::Invalid
+        } else {
+            match i.checked_sub(imported_func_count) {
+                Some(local) => match func_type_idx.get(local) {
+                    Some(type_idx) => ElementRefResolution::Defined {
+                        declared_index: local as u32,
+                        signature: types
+                            .get(*type_idx as usize)
+                            .cloned()
+                            .unwrap_or_else(|| "<unknown>".to_string()),
+                    },
+                    None => ElementRefResolution::Invalid,
+                },
+                None => ElementRefResolution::Invalid,
+            }
+        }
+    };
+
+    let items = match raw.kind {
+        ElementKind::Functions => raw
+            .func_indices
+            .into_iter()
+            .enumerate()
+            .map(|(item_index, raw_index)| {
+                let resolution = resolve_index(raw_index);
+                ElementItem::FuncIndex(ElementFuncIndex {
+                    item_index,
+                    raw_index,
+                    resolution,
+                })
+            })
+            .collect(),
+        ElementKind::Expressions { .. } => raw
+            .exprs
+            .into_iter()
+            .enumerate()
+            .map(|(item_index, expr)| {
+                let expr = match expr {
+                    ElementExpr::RefFunc {
+                        raw_index,
+                        resolution: _,
+                    } => ElementExpr::RefFunc {
+                        raw_index,
+                        resolution: resolve_index(raw_index),
+                    },
+                    other => other,
+                };
+                ElementItem::Expr(ElementExprItem {
+                    item_index,
+                    element_type: match &raw.kind {
+                        ElementKind::Expressions { element_type } => element_type.clone(),
+                        _ => String::new(),
+                    },
+                    expr,
+                })
+            })
+            .collect(),
+    };
+
+    ElementSegment {
+        index: raw.index,
+        mode: raw.mode,
+        table_index: raw.table_index,
+        offset: raw.offset,
+        kind: raw.kind,
+        element_count: raw.element_count,
+        items,
+    }
+}
+
+/// Intermediate result of measuring a function body.
+struct MeasuredBody {
+    body_len_bytes: usize,
+    local_decl_count: usize,
+    local_total: usize,
+    operator_count: usize,
+    max_control_depth: usize,
+    /// Per-family instruction counts, sorted by family name.
+    /// Each operator is counted in exactly one family — classifications are
+    /// exclusive, not overlapping.
+    instruction_inventory: BTreeMap<&'static str, usize>,
+}
+
+/// Measure a single function body's structural metrics.
+///
+/// This is deliberately conservative: it counts operators and tracks
+/// structured-control nesting depth from the encoded byte stream. It does
+/// not evaluate globals, resolve indirect calls, or simulate execution.
+fn measure_code_body(body: wasmparser::FunctionBody<'_>) -> Result<MeasuredBody, String> {
+    let body_len_bytes = body.range().len();
+    let locals_reader = body.get_locals_reader().map_err(|e| e.to_string())?;
+    let mut local_decl_count = 0usize;
+    let mut local_total = 0usize;
+    for item in locals_reader {
+        let (count, _) = item.map_err(|e| e.to_string())?;
+        local_decl_count = local_decl_count
+            .checked_add(1)
+            .ok_or("local declaration count overflow")?;
+        local_total = local_total
+            .checked_add(count as usize)
+            .ok_or("local total count overflow")?;
+    }
+
+    let mut op_reader = body.get_operators_reader().map_err(|e| e.to_string())?;
+    let mut operator_count = 0usize;
+    let mut control_depth = 0usize;
+    let mut max_control_depth = 0usize;
+    let mut inventory: BTreeMap<&'static str, usize> = BTreeMap::new();
+
+    loop {
+        let op = op_reader.read().map_err(|e| e.to_string())?;
+        use wasmparser::Operator;
+        match op {
+            Operator::Block { .. } | Operator::Loop { .. } => {
+                control_depth = control_depth
+                    .checked_add(1)
+                    .ok_or("control depth overflow")?;
+                if control_depth > max_control_depth {
+                    max_control_depth = control_depth;
+                }
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+            }
+            Operator::If { .. } => {
+                control_depth = control_depth
+                    .checked_add(1)
+                    .ok_or("control depth overflow")?;
+                if control_depth > max_control_depth {
+                    max_control_depth = control_depth;
+                }
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+            }
+            Operator::Else => {
+                // `else` continues the enclosing `if`; it opens no new block.
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+            }
+            Operator::End => {
+                if control_depth > 0 {
+                    control_depth = control_depth
+                        .checked_sub(1)
+                        .expect("control depth underflow");
+                }
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+            }
+            Operator::Br { .. } | Operator::BrIf { .. } | Operator::BrTable { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+            }
+            Operator::Return => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+            }
+            Operator::Call { .. } | Operator::CallIndirect { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("call").or_insert(0) += 1;
+            }
+            Operator::ReturnCall { .. } | Operator::ReturnCallIndirect { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("call").or_insert(0) += 1;
+            }
+            Operator::LocalGet { .. } | Operator::LocalSet { .. } | Operator::LocalTee { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("local").or_insert(0) += 1;
+            }
+            Operator::GlobalGet { .. } | Operator::GlobalSet { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("global").or_insert(0) += 1;
+            }
+            Operator::I32Load { .. }
+            | Operator::I64Load { .. }
+            | Operator::F32Load { .. }
+            | Operator::F64Load { .. }
+            | Operator::I32Load8S { .. }
+            | Operator::I32Load8U { .. }
+            | Operator::I32Load16S { .. }
+            | Operator::I32Load16U { .. }
+            | Operator::I64Load8S { .. }
+            | Operator::I64Load8U { .. }
+            | Operator::I64Load16S { .. }
+            | Operator::I64Load16U { .. }
+            | Operator::I64Load32S { .. }
+            | Operator::I64Load32U { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("load").or_insert(0) += 1;
+            }
+            Operator::I32Store { .. }
+            | Operator::I64Store { .. }
+            | Operator::F32Store { .. }
+            | Operator::F64Store { .. }
+            | Operator::I32Store8 { .. }
+            | Operator::I32Store16 { .. }
+            | Operator::I64Store8 { .. }
+            | Operator::I64Store16 { .. }
+            | Operator::I64Store32 { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("store").or_insert(0) += 1;
+            }
+            Operator::MemorySize { .. } | Operator::MemoryGrow { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("memory").or_insert(0) += 1;
+            }
+            Operator::MemoryInit { .. }
+            | Operator::DataDrop { .. }
+            | Operator::MemoryCopy { .. }
+            | Operator::MemoryFill { .. }
+            | Operator::TableInit { .. }
+            | Operator::ElemDrop { .. }
+            | Operator::TableCopy { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("bulk").or_insert(0) += 1;
+            }
+            Operator::TableFill { .. }
+            | Operator::TableGet { .. }
+            | Operator::TableSet { .. }
+            | Operator::TableGrow { .. }
+            | Operator::TableSize { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("table").or_insert(0) += 1;
+            }
+            Operator::I32Const { .. }
+            | Operator::I64Const { .. }
+            | Operator::F32Const { .. }
+            | Operator::F64Const { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("const").or_insert(0) += 1;
+            }
+            Operator::RefNull { .. }
+            | Operator::RefIsNull { .. }
+            | Operator::RefFunc { .. }
+            | Operator::RefEq { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("reference").or_insert(0) += 1;
+            }
+            Operator::I32Eqz { .. }
+            | Operator::I32Eq { .. }
+            | Operator::I32Ne { .. }
+            | Operator::I32LtS { .. }
+            | Operator::I32LtU { .. }
+            | Operator::I32GtS { .. }
+            | Operator::I32GtU { .. }
+            | Operator::I32LeS { .. }
+            | Operator::I32LeU { .. }
+            | Operator::I32GeS { .. }
+            | Operator::I32GeU { .. }
+            | Operator::I64Eqz { .. }
+            | Operator::I64Eq { .. }
+            | Operator::I64Ne { .. }
+            | Operator::I64LtS { .. }
+            | Operator::I64LtU { .. }
+            | Operator::I64GtS { .. }
+            | Operator::I64GtU { .. }
+            | Operator::I64LeS { .. }
+            | Operator::I64LeU { .. }
+            | Operator::I64GeS { .. }
+            | Operator::I64GeU { .. }
+            | Operator::F32Eq { .. }
+            | Operator::F32Ne { .. }
+            | Operator::F32Lt { .. }
+            | Operator::F32Gt { .. }
+            | Operator::F32Le { .. }
+            | Operator::F32Ge { .. }
+            | Operator::F64Eq { .. }
+            | Operator::F64Ne { .. }
+            | Operator::F64Lt { .. }
+            | Operator::F64Gt { .. }
+            | Operator::F64Le { .. }
+            | Operator::F64Ge { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("compare").or_insert(0) += 1;
+            }
+            Operator::I32Clz { .. }
+            | Operator::I32Ctz { .. }
+            | Operator::I32Popcnt { .. }
+            | Operator::I32Add { .. }
+            | Operator::I32Sub { .. }
+            | Operator::I32Mul { .. }
+            | Operator::I32DivS { .. }
+            | Operator::I32DivU { .. }
+            | Operator::I32RemS { .. }
+            | Operator::I32RemU { .. }
+            | Operator::I32And { .. }
+            | Operator::I32Or { .. }
+            | Operator::I32Xor { .. }
+            | Operator::I32Shl { .. }
+            | Operator::I32ShrS { .. }
+            | Operator::I32ShrU { .. }
+            | Operator::I32Rotl { .. }
+            | Operator::I32Rotr { .. }
+            | Operator::I64Clz { .. }
+            | Operator::I64Ctz { .. }
+            | Operator::I64Popcnt { .. }
+            | Operator::I64Add { .. }
+            | Operator::I64Sub { .. }
+            | Operator::I64Mul { .. }
+            | Operator::I64DivS { .. }
+            | Operator::I64DivU { .. }
+            | Operator::I64RemS { .. }
+            | Operator::I64RemU { .. }
+            | Operator::I64And { .. }
+            | Operator::I64Or { .. }
+            | Operator::I64Xor { .. }
+            | Operator::I64Shl { .. }
+            | Operator::I64ShrS { .. }
+            | Operator::I64ShrU { .. }
+            | Operator::I64Rotl { .. }
+            | Operator::I64Rotr { .. }
+            | Operator::F32Abs { .. }
+            | Operator::F32Neg { .. }
+            | Operator::F32Ceil { .. }
+            | Operator::F32Floor { .. }
+            | Operator::F32Trunc { .. }
+            | Operator::F32Nearest { .. }
+            | Operator::F32Sqrt { .. }
+            | Operator::F32Add { .. }
+            | Operator::F32Sub { .. }
+            | Operator::F32Mul { .. }
+            | Operator::F32Div { .. }
+            | Operator::F32Min { .. }
+            | Operator::F32Max { .. }
+            | Operator::F32Copysign { .. }
+            | Operator::F64Abs { .. }
+            | Operator::F64Neg { .. }
+            | Operator::F64Ceil { .. }
+            | Operator::F64Floor { .. }
+            | Operator::F64Trunc { .. }
+            | Operator::F64Nearest { .. }
+            | Operator::F64Sqrt { .. }
+            | Operator::F64Add { .. }
+            | Operator::F64Sub { .. }
+            | Operator::F64Mul { .. }
+            | Operator::F64Div { .. }
+            | Operator::F64Min { .. }
+            | Operator::F64Max { .. }
+            | Operator::F64Copysign { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("numeric").or_insert(0) += 1;
+            }
+            Operator::I32WrapI64 { .. }
+            | Operator::I32TruncF32S { .. }
+            | Operator::I32TruncF32U { .. }
+            | Operator::I32TruncF64S { .. }
+            | Operator::I32TruncF64U { .. }
+            | Operator::I64ExtendI32S { .. }
+            | Operator::I64ExtendI32U { .. }
+            | Operator::I64TruncF32S { .. }
+            | Operator::I64TruncF32U { .. }
+            | Operator::I64TruncF64S { .. }
+            | Operator::I64TruncF64U { .. }
+            | Operator::F32ConvertI32S { .. }
+            | Operator::F32ConvertI32U { .. }
+            | Operator::F32ConvertI64S { .. }
+            | Operator::F32ConvertI64U { .. }
+            | Operator::F32DemoteF64 { .. }
+            | Operator::F64ConvertI32S { .. }
+            | Operator::F64ConvertI32U { .. }
+            | Operator::F64ConvertI64S { .. }
+            | Operator::F64ConvertI64U { .. }
+            | Operator::F64PromoteF32 { .. }
+            | Operator::I32ReinterpretF32 { .. }
+            | Operator::I64ReinterpretF64 { .. }
+            | Operator::F32ReinterpretI32 { .. }
+            | Operator::F64ReinterpretI64 { .. }
+            | Operator::I32Extend8S { .. }
+            | Operator::I32Extend16S { .. }
+            | Operator::I64Extend8S { .. }
+            | Operator::I64Extend16S { .. }
+            | Operator::I64Extend32S { .. }
+            | Operator::I32TruncSatF32S { .. }
+            | Operator::I32TruncSatF32U { .. }
+            | Operator::I32TruncSatF64S { .. }
+            | Operator::I32TruncSatF64U { .. }
+            | Operator::I64TruncSatF32S { .. }
+            | Operator::I64TruncSatF32U { .. }
+            | Operator::I64TruncSatF64S { .. }
+            | Operator::I64TruncSatF64U { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("conversion").or_insert(0) += 1;
+            }
+            Operator::Select { .. } | Operator::TypedSelect { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("select").or_insert(0) += 1;
+            }
+            Operator::Drop | Operator::Nop | Operator::Unreachable => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("misc").or_insert(0) += 1;
+            }
+            Operator::StructNew { .. }
+            | Operator::StructNewDefault { .. }
+            | Operator::StructGet { .. }
+            | Operator::StructGetS { .. }
+            | Operator::StructGetU { .. }
+            | Operator::StructSet { .. }
+            | Operator::ArrayNew { .. }
+            | Operator::ArrayNewDefault { .. }
+            | Operator::ArrayNewFixed { .. }
+            | Operator::ArrayNewData { .. }
+            | Operator::ArrayNewElem { .. }
+            | Operator::ArrayGet { .. }
+            | Operator::ArrayGetS { .. }
+            | Operator::ArrayGetU { .. }
+            | Operator::ArraySet { .. }
+            | Operator::ArrayLen { .. }
+            | Operator::ArrayFill { .. }
+            | Operator::ArrayCopy { .. }
+            | Operator::ArrayInitData { .. }
+            | Operator::ArrayInitElem { .. }
+            | Operator::RefTestNonNull { .. }
+            | Operator::RefTestNullable { .. }
+            | Operator::RefCastNonNull { .. }
+            | Operator::RefCastNullable { .. }
+            | Operator::BrOnCast { .. }
+            | Operator::BrOnCastFail { .. }
+            | Operator::AnyConvertExtern { .. }
+            | Operator::ExternConvertAny { .. }
+            | Operator::RefI31 { .. }
+            | Operator::I31GetS { .. }
+            | Operator::I31GetU { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("gc").or_insert(0) += 1;
+            }
+            Operator::CallRef { .. } | Operator::ReturnCallRef { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("call").or_insert(0) += 1;
+            }
+            Operator::BrOnNull { .. } | Operator::BrOnNonNull { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("control").or_insert(0) += 1;
+            }
+            Operator::RefAsNonNull { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("reference").or_insert(0) += 1;
+            }
+            Operator::MemoryAtomicNotify { .. }
+            | Operator::MemoryAtomicWait32 { .. }
+            | Operator::MemoryAtomicWait64 { .. }
+            | Operator::AtomicFence { .. }
+            | Operator::I32AtomicLoad { .. }
+            | Operator::I64AtomicLoad { .. }
+            | Operator::I32AtomicLoad8U { .. }
+            | Operator::I32AtomicLoad16U { .. }
+            | Operator::I64AtomicLoad8U { .. }
+            | Operator::I64AtomicLoad16U { .. }
+            | Operator::I64AtomicLoad32U { .. }
+            | Operator::I32AtomicStore { .. }
+            | Operator::I64AtomicStore { .. }
+            | Operator::I32AtomicStore8 { .. }
+            | Operator::I32AtomicStore16 { .. }
+            | Operator::I64AtomicStore8 { .. }
+            | Operator::I64AtomicStore16 { .. }
+            | Operator::I64AtomicStore32 { .. }
+            | Operator::I32AtomicRmwAdd { .. }
+            | Operator::I64AtomicRmwAdd { .. }
+            | Operator::I32AtomicRmw8AddU { .. }
+            | Operator::I32AtomicRmw16AddU { .. }
+            | Operator::I64AtomicRmw8AddU { .. }
+            | Operator::I64AtomicRmw16AddU { .. }
+            | Operator::I64AtomicRmw32AddU { .. }
+            | Operator::I32AtomicRmwSub { .. }
+            | Operator::I64AtomicRmwSub { .. }
+            | Operator::I32AtomicRmw8SubU { .. }
+            | Operator::I32AtomicRmw16SubU { .. }
+            | Operator::I64AtomicRmw8SubU { .. }
+            | Operator::I64AtomicRmw16SubU { .. }
+            | Operator::I64AtomicRmw32SubU { .. }
+            | Operator::I32AtomicRmwAnd { .. }
+            | Operator::I64AtomicRmwAnd { .. }
+            | Operator::I32AtomicRmw8AndU { .. }
+            | Operator::I32AtomicRmw16AndU { .. }
+            | Operator::I64AtomicRmw8AndU { .. }
+            | Operator::I64AtomicRmw16AndU { .. }
+            | Operator::I64AtomicRmw32AndU { .. }
+            | Operator::I32AtomicRmwOr { .. }
+            | Operator::I64AtomicRmwOr { .. }
+            | Operator::I32AtomicRmw8OrU { .. }
+            | Operator::I32AtomicRmw16OrU { .. }
+            | Operator::I64AtomicRmw8OrU { .. }
+            | Operator::I64AtomicRmw16OrU { .. }
+            | Operator::I64AtomicRmw32OrU { .. }
+            | Operator::I32AtomicRmwXor { .. }
+            | Operator::I64AtomicRmwXor { .. }
+            | Operator::I32AtomicRmw8XorU { .. }
+            | Operator::I32AtomicRmw16XorU { .. }
+            | Operator::I64AtomicRmw8XorU { .. }
+            | Operator::I64AtomicRmw16XorU { .. }
+            | Operator::I64AtomicRmw32XorU { .. }
+            | Operator::I32AtomicRmwXchg { .. }
+            | Operator::I64AtomicRmwXchg { .. }
+            | Operator::I32AtomicRmw8XchgU { .. }
+            | Operator::I32AtomicRmw16XchgU { .. }
+            | Operator::I64AtomicRmw8XchgU { .. }
+            | Operator::I64AtomicRmw16XchgU { .. }
+            | Operator::I64AtomicRmw32XchgU { .. }
+            | Operator::I32AtomicRmwCmpxchg { .. }
+            | Operator::I64AtomicRmwCmpxchg { .. }
+            | Operator::I32AtomicRmw8CmpxchgU { .. }
+            | Operator::I32AtomicRmw16CmpxchgU { .. }
+            | Operator::I64AtomicRmw8CmpxchgU { .. }
+            | Operator::I64AtomicRmw16CmpxchgU { .. }
+            | Operator::I64AtomicRmw32CmpxchgU { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("atomic").or_insert(0) += 1;
+            }
+            Operator::V128Load { .. }
+            | Operator::V128Load8x8S { .. }
+            | Operator::V128Load8x8U { .. }
+            | Operator::V128Load16x4S { .. }
+            | Operator::V128Load16x4U { .. }
+            | Operator::V128Load32x2S { .. }
+            | Operator::V128Load32x2U { .. }
+            | Operator::V128Load8Splat { .. }
+            | Operator::V128Load16Splat { .. }
+            | Operator::V128Load32Splat { .. }
+            | Operator::V128Load64Splat { .. }
+            | Operator::V128Load32Zero { .. }
+            | Operator::V128Load64Zero { .. }
+            | Operator::V128Store { .. }
+            | Operator::V128Load8Lane { .. }
+            | Operator::V128Load16Lane { .. }
+            | Operator::V128Load32Lane { .. }
+            | Operator::V128Load64Lane { .. }
+            | Operator::V128Store8Lane { .. }
+            | Operator::V128Store16Lane { .. }
+            | Operator::V128Store32Lane { .. }
+            | Operator::V128Store64Lane { .. }
+            | Operator::V128Const { .. }
+            | Operator::I8x16Shuffle { .. }
+            | Operator::I8x16ExtractLaneS { .. }
+            | Operator::I8x16ExtractLaneU { .. }
+            | Operator::I8x16ReplaceLane { .. }
+            | Operator::I16x8ExtractLaneS { .. }
+            | Operator::I16x8ExtractLaneU { .. }
+            | Operator::I16x8ReplaceLane { .. }
+            | Operator::I32x4ExtractLane { .. }
+            | Operator::I32x4ReplaceLane { .. }
+            | Operator::I64x2ExtractLane { .. }
+            | Operator::I64x2ReplaceLane { .. }
+            | Operator::F32x4ExtractLane { .. }
+            | Operator::F32x4ReplaceLane { .. }
+            | Operator::F64x2ExtractLane { .. }
+            | Operator::F64x2ReplaceLane { .. }
+            | Operator::I8x16Swizzle { .. }
+            | Operator::I8x16Splat { .. }
+            | Operator::I16x8Splat { .. }
+            | Operator::I32x4Splat { .. }
+            | Operator::I64x2Splat { .. }
+            | Operator::F32x4Splat { .. }
+            | Operator::F64x2Splat { .. }
+            | Operator::I8x16Eq { .. }
+            | Operator::I8x16Ne { .. }
+            | Operator::I8x16LtS { .. }
+            | Operator::I8x16LtU { .. }
+            | Operator::I8x16GtS { .. }
+            | Operator::I8x16GtU { .. }
+            | Operator::I8x16LeS { .. }
+            | Operator::I8x16LeU { .. }
+            | Operator::I8x16GeS { .. }
+            | Operator::I8x16GeU { .. }
+            | Operator::I16x8Eq { .. }
+            | Operator::I16x8Ne { .. }
+            | Operator::I16x8LtS { .. }
+            | Operator::I16x8LtU { .. }
+            | Operator::I16x8GtS { .. }
+            | Operator::I16x8GtU { .. }
+            | Operator::I16x8LeS { .. }
+            | Operator::I16x8LeU { .. }
+            | Operator::I16x8GeS { .. }
+            | Operator::I16x8GeU { .. }
+            | Operator::I32x4Eq { .. }
+            | Operator::I32x4Ne { .. }
+            | Operator::I32x4LtS { .. }
+            | Operator::I32x4LtU { .. }
+            | Operator::I32x4GtS { .. }
+            | Operator::I32x4GtU { .. }
+            | Operator::I32x4LeS { .. }
+            | Operator::I32x4LeU { .. }
+            | Operator::I32x4GeS { .. }
+            | Operator::I32x4GeU { .. }
+            | Operator::I64x2Eq { .. }
+            | Operator::I64x2Ne { .. }
+            | Operator::I64x2LtS { .. }
+            | Operator::I64x2GtS { .. }
+            | Operator::I64x2LeS { .. }
+            | Operator::I64x2GeS { .. }
+            | Operator::F32x4Eq { .. }
+            | Operator::F32x4Ne { .. }
+            | Operator::F32x4Lt { .. }
+            | Operator::F32x4Gt { .. }
+            | Operator::F32x4Le { .. }
+            | Operator::F32x4Ge { .. }
+            | Operator::F64x2Eq { .. }
+            | Operator::F64x2Ne { .. }
+            | Operator::F64x2Lt { .. }
+            | Operator::F64x2Gt { .. }
+            | Operator::F64x2Le { .. }
+            | Operator::F64x2Ge { .. }
+            | Operator::V128Not { .. }
+            | Operator::V128And { .. }
+            | Operator::V128AndNot { .. }
+            | Operator::V128Or { .. }
+            | Operator::V128Xor { .. }
+            | Operator::V128Bitselect { .. }
+            | Operator::V128AnyTrue { .. }
+            | Operator::I8x16Abs { .. }
+            | Operator::I8x16Neg { .. }
+            | Operator::I8x16Popcnt { .. }
+            | Operator::I8x16AllTrue { .. }
+            | Operator::I8x16Bitmask { .. }
+            | Operator::I8x16NarrowI16x8S { .. }
+            | Operator::I8x16NarrowI16x8U { .. }
+            | Operator::I8x16Shl { .. }
+            | Operator::I8x16ShrS { .. }
+            | Operator::I8x16ShrU { .. }
+            | Operator::I8x16Add { .. }
+            | Operator::I8x16AddSatS { .. }
+            | Operator::I8x16AddSatU { .. }
+            | Operator::I8x16Sub { .. }
+            | Operator::I8x16SubSatS { .. }
+            | Operator::I8x16SubSatU { .. }
+            | Operator::I8x16MinS { .. }
+            | Operator::I8x16MinU { .. }
+            | Operator::I8x16MaxS { .. }
+            | Operator::I8x16MaxU { .. }
+            | Operator::I8x16AvgrU { .. }
+            | Operator::I16x8ExtAddPairwiseI8x16S { .. }
+            | Operator::I16x8ExtAddPairwiseI8x16U { .. }
+            | Operator::I16x8Abs { .. }
+            | Operator::I16x8Neg { .. }
+            | Operator::I16x8Q15MulrSatS { .. }
+            | Operator::I16x8AllTrue { .. }
+            | Operator::I16x8Bitmask { .. }
+            | Operator::I16x8NarrowI32x4S { .. }
+            | Operator::I16x8NarrowI32x4U { .. }
+            | Operator::I16x8ExtendLowI8x16S { .. }
+            | Operator::I16x8ExtendHighI8x16S { .. }
+            | Operator::I16x8ExtendLowI8x16U { .. }
+            | Operator::I16x8ExtendHighI8x16U { .. }
+            | Operator::I16x8Shl { .. }
+            | Operator::I16x8ShrS { .. }
+            | Operator::I16x8ShrU { .. }
+            | Operator::I16x8Add { .. }
+            | Operator::I16x8AddSatS { .. }
+            | Operator::I16x8AddSatU { .. }
+            | Operator::I16x8Sub { .. }
+            | Operator::I16x8SubSatS { .. }
+            | Operator::I16x8SubSatU { .. }
+            | Operator::I16x8Mul { .. }
+            | Operator::I16x8MinS { .. }
+            | Operator::I16x8MinU { .. }
+            | Operator::I16x8MaxS { .. }
+            | Operator::I16x8MaxU { .. }
+            | Operator::I16x8AvgrU { .. }
+            | Operator::I16x8ExtMulLowI8x16S { .. }
+            | Operator::I16x8ExtMulHighI8x16S { .. }
+            | Operator::I16x8ExtMulLowI8x16U { .. }
+            | Operator::I16x8ExtMulHighI8x16U { .. }
+            | Operator::I32x4ExtAddPairwiseI16x8S { .. }
+            | Operator::I32x4ExtAddPairwiseI16x8U { .. }
+            | Operator::I32x4Abs { .. }
+            | Operator::I32x4Neg { .. }
+            | Operator::I32x4AllTrue { .. }
+            | Operator::I32x4Bitmask { .. }
+            | Operator::I32x4ExtendLowI16x8S { .. }
+            | Operator::I32x4ExtendHighI16x8S { .. }
+            | Operator::I32x4ExtendLowI16x8U { .. }
+            | Operator::I32x4ExtendHighI16x8U { .. }
+            | Operator::I32x4Shl { .. }
+            | Operator::I32x4ShrS { .. }
+            | Operator::I32x4ShrU { .. }
+            | Operator::I32x4Add { .. }
+            | Operator::I32x4Sub { .. }
+            | Operator::I32x4Mul { .. }
+            | Operator::I32x4MinS { .. }
+            | Operator::I32x4MinU { .. }
+            | Operator::I32x4MaxS { .. }
+            | Operator::I32x4MaxU { .. }
+            | Operator::I32x4DotI16x8S { .. }
+            | Operator::I32x4ExtMulLowI16x8S { .. }
+            | Operator::I32x4ExtMulHighI16x8S { .. }
+            | Operator::I32x4ExtMulLowI16x8U { .. }
+            | Operator::I32x4ExtMulHighI16x8U { .. }
+            | Operator::I64x2Abs { .. }
+            | Operator::I64x2Neg { .. }
+            | Operator::I64x2AllTrue { .. }
+            | Operator::I64x2Bitmask { .. }
+            | Operator::I64x2ExtendLowI32x4S { .. }
+            | Operator::I64x2ExtendHighI32x4S { .. }
+            | Operator::I64x2ExtendLowI32x4U { .. }
+            | Operator::I64x2ExtendHighI32x4U { .. }
+            | Operator::I64x2Shl { .. }
+            | Operator::I64x2ShrS { .. }
+            | Operator::I64x2ShrU { .. }
+            | Operator::I64x2Add { .. }
+            | Operator::I64x2Sub { .. }
+            | Operator::I64x2Mul { .. }
+            | Operator::I64x2ExtMulLowI32x4S { .. }
+            | Operator::I64x2ExtMulHighI32x4S { .. }
+            | Operator::I64x2ExtMulLowI32x4U { .. }
+            | Operator::I64x2ExtMulHighI32x4U { .. }
+            | Operator::F32x4Ceil { .. }
+            | Operator::F32x4Floor { .. }
+            | Operator::F32x4Trunc { .. }
+            | Operator::F32x4Nearest { .. }
+            | Operator::F32x4Abs { .. }
+            | Operator::F32x4Neg { .. }
+            | Operator::F32x4Sqrt { .. }
+            | Operator::F32x4Add { .. }
+            | Operator::F32x4Sub { .. }
+            | Operator::F32x4Mul { .. }
+            | Operator::F32x4Div { .. }
+            | Operator::F32x4Min { .. }
+            | Operator::F32x4Max { .. }
+            | Operator::F32x4PMin { .. }
+            | Operator::F32x4PMax { .. }
+            | Operator::F64x2Ceil { .. }
+            | Operator::F64x2Floor { .. }
+            | Operator::F64x2Trunc { .. }
+            | Operator::F64x2Nearest { .. }
+            | Operator::F64x2Abs { .. }
+            | Operator::F64x2Neg { .. }
+            | Operator::F64x2Sqrt { .. }
+            | Operator::F64x2Add { .. }
+            | Operator::F64x2Sub { .. }
+            | Operator::F64x2Mul { .. }
+            | Operator::F64x2Div { .. }
+            | Operator::F64x2Min { .. }
+            | Operator::F64x2Max { .. }
+            | Operator::F64x2PMin { .. }
+            | Operator::F64x2PMax { .. }
+            | Operator::I32x4TruncSatF32x4S { .. }
+            | Operator::I32x4TruncSatF32x4U { .. }
+            | Operator::F32x4ConvertI32x4S { .. }
+            | Operator::F32x4ConvertI32x4U { .. }
+            | Operator::I32x4TruncSatF64x2SZero { .. }
+            | Operator::I32x4TruncSatF64x2UZero { .. }
+            | Operator::F64x2ConvertLowI32x4S { .. }
+            | Operator::F64x2ConvertLowI32x4U { .. }
+            | Operator::F32x4DemoteF64x2Zero { .. }
+            | Operator::F64x2PromoteLowF32x4 { .. }
+            | Operator::I8x16RelaxedSwizzle { .. }
+            | Operator::I32x4RelaxedTruncF32x4S { .. }
+            | Operator::I32x4RelaxedTruncF32x4U { .. }
+            | Operator::I32x4RelaxedTruncF64x2SZero { .. }
+            | Operator::I32x4RelaxedTruncF64x2UZero { .. }
+            | Operator::F32x4RelaxedMadd { .. }
+            | Operator::F32x4RelaxedNmadd { .. }
+            | Operator::F64x2RelaxedMadd { .. }
+            | Operator::F64x2RelaxedNmadd { .. }
+            | Operator::I8x16RelaxedLaneselect { .. }
+            | Operator::I16x8RelaxedLaneselect { .. }
+            | Operator::I32x4RelaxedLaneselect { .. }
+            | Operator::I64x2RelaxedLaneselect { .. }
+            | Operator::F32x4RelaxedMin { .. }
+            | Operator::F32x4RelaxedMax { .. }
+            | Operator::F64x2RelaxedMin { .. }
+            | Operator::F64x2RelaxedMax { .. }
+            | Operator::I16x8RelaxedQ15mulrS { .. }
+            | Operator::I16x8RelaxedDotI8x16I7x16S { .. }
+            | Operator::I32x4RelaxedDotI8x16I7x16AddS { .. } => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("simd").or_insert(0) += 1;
+            }
+            _ => {
+                operator_count = operator_count
+                    .checked_add(1)
+                    .ok_or("operator count overflow")?;
+                *inventory.entry("other").or_insert(0) += 1;
+            }
+        }
+        // The function-body end is the last operator in the body. The
+        // operators reader reports EOF after it, so we detect it by checking
+        // whether the reader is exhausted.
+        if op_reader.eof() {
+            // Exclude the function-body end from the operator count and the
+            // inventory, so the two stay consistent.
+            operator_count = operator_count
+                .checked_sub(1)
+                .expect("operator count underflow");
+            if let Some(c) = inventory.get_mut("control") {
+                *c = c.checked_sub(1).expect("control count underflow");
+            }
+            break;
+        }
+    }
+
+    Ok(MeasuredBody {
+        body_len_bytes,
+        local_decl_count,
+        local_total,
+        operator_count,
+        max_control_depth,
+        instruction_inventory: inventory.into_iter().filter(|(_, v)| *v > 0).collect(),
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ModuleStructure {
+    /// Defined (non-imported) memories: minimum and, if present, maximum pages.
+    pub memories: Vec<MemoryBounds>,
+    /// Defined (non-imported) tables: element type plus limits.
+    pub tables: Vec<TableBounds>,
+    /// Defined (non-imported) globals: mutability and value type.
+    pub globals: Vec<GlobalEntry>,
+    /// Number of active/passive data segments.
+    pub data_segments: usize,
+    /// Per-segment details, in declaration order. Empty when the module has
+    /// no data section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_segment_details: Vec<DataSegment>,
+    /// Number of element segments.
+    pub element_segments: usize,
+    /// Per-segment details, in declaration order. Empty when the module has
+    /// no element section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub element_segment_details: Vec<ElementSegment>,
+    /// Function index of the start section, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_func: Option<u32>,
+    /// Resolved detail of the start function, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_function: Option<StartFunction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryBounds {
+    pub min_pages: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pages: Option<u64>,
+    /// True when this memory is 64-bit (memory64 proposal).
+    pub is64: bool,
+    /// True when this memory is shared (threads proposal).
+    #[serde(default)]
+    pub shared: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TableBounds {
+    pub element_type: String,
+    pub min_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GlobalEntry {
+    pub mutable: bool,
+    pub value_type: String,
+}
+
+/// A single compatibility or resource finding.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Finding {
+    /// Stable machine-readable code (e.g. `float_ops`, `memory64`).
+    pub code: String,
+    /// `incompatible`, `unsupported`, or `unknown`.
+    pub severity: String,
+    /// Concise human-readable explanation.
+    pub message: String,
+}
+
+/// Which compatibility areas were actually checked, and which were not.
+///
+/// `checked` lists areas where a rule ran against this module. `not_checked`
+/// lists areas with no implemented rule. An empty `findings` array means no
+/// implemented rule reported a finding — it does NOT mean the module is
+/// Soroban-compatible, because `not_checked` areas were never evaluated.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Coverage {
+    /// Areas where a rule ran. Sorted alphabetically for deterministic output.
+    pub checked: Vec<String>,
+    /// Areas with no implemented rule. Sorted alphabetically.
+    pub not_checked: Vec<String>,
+}
+
+/// Resource and compatibility analysis for a WASM module.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct Analysis {
+    /// Imported memories (module::name pairs).
+    pub imported_memories: Vec<String>,
+    /// Defined memories with their bounds.
+    pub defined_memories: Vec<MemoryBounds>,
+    /// Imported tables (module::name pairs).
+    pub imported_tables: Vec<String>,
+    /// Defined tables with their bounds.
+    pub defined_tables: Vec<TableBounds>,
+    /// Imported globals (module::name pairs).
+    pub imported_globals: Vec<String>,
+    /// Defined globals.
+    pub defined_globals: Vec<GlobalEntry>,
+    /// Total function count (imported + defined).
+    pub function_count: usize,
+    /// Data segment count.
+    pub data_segment_count: usize,
+    /// Element segment count.
+    pub element_segment_count: usize,
+    /// Compatibility findings.
+    pub findings: Vec<Finding>,
+    /// Which areas were checked vs not checked.
+    pub coverage: Coverage,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,6 +1483,18 @@ pub struct ImportEntry {
     /// Raw type signature when the import is a function.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_sig: Option<String>,
+    /// Type index into the type section when the import is a function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_index: Option<u32>,
+    /// Memory details when the import is a memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryBounds>,
+    /// Table details when the import is a table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<TableBounds>,
+    /// Global details when the import is a global.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global: Option<GlobalEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +1502,22 @@ pub struct ExportEntry {
     pub name: String,
     pub kind: String,
     pub index: u32,
+    /// Signature when the export is a function (resolved from the module's
+    /// type section via the full function index space, imports included).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_sig: Option<String>,
+    /// Type index into the type section when the export is a function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_index: Option<u32>,
+    /// Memory details when the export is a memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryBounds>,
+    /// Table details when the export is a table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<TableBounds>,
+    /// Global details when the export is a global.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global: Option<GlobalEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,11 +1526,96 @@ pub struct CustomSection {
     pub len_bytes: usize,
 }
 
+/// Detailed entry for a single custom section, in declaration order.
+///
+/// `len_bytes` is the length of the custom section's data payload as returned
+/// by `wasmparser`'s `CustomSectionReader::data()` — i.e., the bytes after the
+/// encoded section name, not including the name itself or the section header.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CustomSectionDetail {
+    /// 0-based position in the custom-section list (declaration order).
+    pub index: usize,
+    /// Section name.
+    pub name: String,
+    /// Data payload length in bytes (excluding the encoded name).
+    pub len_bytes: usize,
+    /// Classification based on the section name. Well-known names are
+    /// classified accordingly; everything else is `unknown`. No security
+    /// or trust inference is made from the name.
+    #[serde(rename = "classification")]
+    pub kind: CustomSectionKind,
+}
+
+/// Classification of a custom section based on its name.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomSectionKind {
+    /// The WASM "name" section (function names, local names, etc.).
+    Name,
+    /// The WASM "producers" section (toolchain metadata).
+    Producers,
+    /// Any other custom section.
+    Unknown,
+}
+
+/// Classify a custom section by name.
+///
+/// Only the two standardized WASM custom-section names are classified:
+/// `name` and `producers`. Everything else — including Soroban-specific
+/// sections such as `contractspecv0` — stays `unknown`, because this tool
+/// does not decode them here and must not imply anything about their
+/// contents from the name alone.
+fn classify_custom_section_name(name: &str) -> CustomSectionKind {
+    match name {
+        "name" => CustomSectionKind::Name,
+        "producers" => CustomSectionKind::Producers,
+        _ => CustomSectionKind::Unknown,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FunctionSig {
     pub index: u32,
     pub params: Vec<String>,
     pub results: Vec<String>,
+}
+
+/// Bounded structural metrics for one defined function body.
+///
+/// These are static, parse-time counts of the encoded body. They describe the
+/// shape of the code as written, not what it costs to run: they are not gas
+/// estimates, execution-time proxies, complexity scores, or security signals.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CodeBodyMetrics {
+    /// 0-based position among defined functions (declaration order).
+    pub defined_index: usize,
+    /// Raw WASM function index (imported functions occupy the lowest indices,
+    /// so this is `imported_function_count + defined_index`).
+    pub function_index: u32,
+    /// Rendered signature when the function's type was resolved; null when
+    /// unavailable. Never guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Body byte length: the encoded size of the function body, including the
+    /// locals declarations and the operator stream, excluding the body-length
+    /// prefix itself.
+    pub body_len_bytes: usize,
+    /// Number of local declarations (distinct `count:type` pairs).
+    pub local_decl_count: usize,
+    /// Total number of local variables declared (sum of all declaration counts).
+    pub local_total: usize,
+    /// Number of operators in the body, excluding the trailing `end` of the
+    /// function body itself.
+    pub operator_count: usize,
+    /// Maximum structured-control nesting depth reached by `block`, `loop`,
+    /// and `if` operators, matched against their `end` operators. The implicit
+    /// function-body block is not counted.
+    pub max_control_depth: usize,
+    /// Per-family instruction counts, sorted by family name. Each operator is
+    /// counted in exactly one family — classifications are exclusive, not
+    /// overlapping. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub instruction_inventory: BTreeMap<String, usize>,
 }
 
 /// Errors that can occur during inspection.
@@ -88,12 +1654,45 @@ pub fn inspect(bytes: &[u8], validate: bool) -> Result<WasmReport, InspectError>
         imports: Vec::new(),
         exports: Vec::new(),
         custom_sections: Vec::new(),
+        custom_section_details: Vec::new(),
+        code_body_metrics: Vec::new(),
         functions: Vec::new(),
+        structure: None,
+        analysis: None,
+        interface: None,
     };
+
+    // Module-structure accumulators (only emitted when non-empty).
+    let mut memories: Vec<MemoryBounds> = Vec::new();
+    let mut tables: Vec<TableBounds> = Vec::new();
+    let mut globals: Vec<GlobalEntry> = Vec::new();
+    let mut data_segments: usize = 0;
+    let mut data_segment_details: Vec<DataSegment> = Vec::new();
+    let mut element_segments: usize = 0;
+    // Raw element segments are collected during the payload loop and resolved
+    // after it, because function-index resolution needs the complete function
+    // index space (imports first, then defined functions).
+    let mut raw_element_segments: Vec<RawElementSegment> = Vec::new();
+    let mut start_func: Option<u32> = None;
+    // Raw code-section bodies are collected during the payload loop and
+    // resolved after it, because metrics need the complete function index
+    // space (imports first, then defined functions).
+    let mut raw_code_bodies: Vec<wasmparser::FunctionBody<'_>> = Vec::new();
 
     // Collect all type signatures first so imports/exports can reference them.
     let mut types: Vec<String> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
+
+    // Per-kind index spaces. WASM indices span imports first, then locally
+    // defined items, so exported indices must be resolved against these
+    // concatenated spaces rather than the defined-only vectors alone.
+    let mut imported_func_type_idx: Vec<u32> = Vec::new();
+    let mut imported_memories: Vec<MemoryBounds> = Vec::new();
+    let mut imported_tables: Vec<TableBounds> = Vec::new();
+    let mut imported_globals: Vec<GlobalEntry> = Vec::new();
+    // Export references are resolved after the payload loop so section order
+    // cannot affect the result.
+    let mut export_refs: Vec<(String, &'static str, u32)> = Vec::new();
 
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.map_err(|e| InspectError::Malformed(e.to_string()))?;
@@ -117,21 +1716,76 @@ pub fn inspect(bytes: &[u8], validate: bool) -> Result<WasmReport, InspectError>
             Payload::ImportSection(reader) => {
                 for import in reader {
                     let import = import.map_err(|e| InspectError::Malformed(e.to_string()))?;
-                    let (kind, sig) = match import.ty {
-                        TypeRef::Func(idx) => {
-                            ("function".to_string(), types.get(idx as usize).cloned())
-                        }
-                        TypeRef::Table(_) => ("table".to_string(), None),
-                        TypeRef::Memory(_) => ("memory".to_string(), None),
-                        TypeRef::Global(_) => ("global".to_string(), None),
-                        TypeRef::Tag(_) => ("tag".to_string(), None),
+                    let (kind, sig, type_index, memory, table, global) = match import.ty {
+                        TypeRef::Func(idx) => (
+                            "function".to_string(),
+                            types.get(idx as usize).cloned(),
+                            Some(idx),
+                            None,
+                            None,
+                            None,
+                        ),
+                        TypeRef::Table(t) => (
+                            "table".to_string(),
+                            None,
+                            None,
+                            None,
+                            Some(TableBounds {
+                                element_type: format!("{:?}", t.element_type),
+                                min_size: u64::from(t.initial),
+                                max_size: t.maximum.map(u64::from),
+                            }),
+                            None,
+                        ),
+                        TypeRef::Memory(m) => (
+                            "memory".to_string(),
+                            None,
+                            None,
+                            Some(MemoryBounds {
+                                min_pages: m.initial,
+                                max_pages: m.maximum,
+                                is64: m.memory64,
+                                shared: m.shared,
+                            }),
+                            None,
+                            None,
+                        ),
+                        TypeRef::Global(g) => (
+                            "global".to_string(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(GlobalEntry {
+                                mutable: g.mutable,
+                                value_type: format!("{:?}", g.content_type),
+                            }),
+                        ),
+                        TypeRef::Tag(_) => ("tag".to_string(), None, None, None, None, None),
                     };
                     report.imports.push(ImportEntry {
                         module: import.module.to_string(),
                         name: import.name.to_string(),
                         kind,
                         type_sig: sig,
+                        type_index,
+                        memory,
+                        table,
+                        global,
                     });
+                    // Imports occupy the lowest slots of each index space.
+                    if let Some(ti) = type_index {
+                        imported_func_type_idx.push(ti);
+                    }
+                    if let Some(m) = report.imports.last().and_then(|i| i.memory.clone()) {
+                        imported_memories.push(m);
+                    }
+                    if let Some(t) = report.imports.last().and_then(|i| i.table.clone()) {
+                        imported_tables.push(t);
+                    }
+                    if let Some(g) = report.imports.last().and_then(|i| i.global.clone()) {
+                        imported_globals.push(g);
+                    }
                 }
             }
             Payload::FunctionSection(reader) => {
@@ -143,17 +1797,14 @@ pub fn inspect(bytes: &[u8], validate: bool) -> Result<WasmReport, InspectError>
             Payload::ExportSection(reader) => {
                 for export in reader {
                     let export = export.map_err(|e| InspectError::Malformed(e.to_string()))?;
-                    report.exports.push(ExportEntry {
-                        name: export.name.to_string(),
-                        kind: match export.kind {
-                            wasmparser::ExternalKind::Func => "function".to_string(),
-                            wasmparser::ExternalKind::Table => "table".to_string(),
-                            wasmparser::ExternalKind::Memory => "memory".to_string(),
-                            wasmparser::ExternalKind::Global => "global".to_string(),
-                            wasmparser::ExternalKind::Tag => "tag".to_string(),
-                        },
-                        index: export.index,
-                    });
+                    let kind = match export.kind {
+                        wasmparser::ExternalKind::Func => "function",
+                        wasmparser::ExternalKind::Table => "table",
+                        wasmparser::ExternalKind::Memory => "memory",
+                        wasmparser::ExternalKind::Global => "global",
+                        wasmparser::ExternalKind::Tag => "tag",
+                    };
+                    export_refs.push((export.name.to_string(), kind, export.index));
                 }
             }
             Payload::CustomSection(reader) => {
@@ -161,9 +1812,264 @@ pub fn inspect(bytes: &[u8], validate: bool) -> Result<WasmReport, InspectError>
                     name: reader.name().to_string(),
                     len_bytes: reader.data().len(),
                 });
+                let kind = classify_custom_section_name(reader.name());
+                report.custom_section_details.push(CustomSectionDetail {
+                    index: report.custom_section_details.len(),
+                    name: reader.name().to_string(),
+                    len_bytes: reader.data().len(),
+                    kind,
+                });
+            }
+            Payload::MemorySection(reader) => {
+                for mem in reader {
+                    let mem = mem.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    memories.push(MemoryBounds {
+                        min_pages: mem.initial,
+                        max_pages: mem.maximum,
+                        is64: mem.memory64,
+                        shared: mem.shared,
+                    });
+                }
+            }
+            Payload::TableSection(reader) => {
+                for table in reader {
+                    let table = table.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    tables.push(TableBounds {
+                        element_type: format!("{:?}", table.ty.element_type),
+                        min_size: u64::from(table.ty.initial),
+                        max_size: table.ty.maximum.map(u64::from),
+                    });
+                }
+            }
+            Payload::GlobalSection(reader) => {
+                for global in reader {
+                    let global = global.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    globals.push(GlobalEntry {
+                        mutable: global.ty.mutable,
+                        value_type: format!("{:?}", global.ty.content_type),
+                    });
+                }
+            }
+            Payload::DataSection(reader) => {
+                for segment in reader {
+                    let seg = segment.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    let index = data_segments;
+                    data_segments += 1;
+                    let (mode, memory_index, offset) = match seg.kind {
+                        wasmparser::DataKind::Passive => (DataSegmentMode::Passive, None, None),
+                        wasmparser::DataKind::Active {
+                            memory_index,
+                            offset_expr,
+                        } => {
+                            let offset = match classify_const_expr(&offset_expr) {
+                                Ok(expr) => expr,
+                                Err(reason) => OffsetExpr::Unsupported { reason },
+                            };
+                            (DataSegmentMode::Active, Some(memory_index), Some(offset))
+                        }
+                    };
+                    data_segment_details.push(DataSegment {
+                        index,
+                        mode,
+                        memory_index,
+                        offset,
+                        payload_len: seg.data.len(),
+                    });
+                }
+            }
+            Payload::ElementSection(reader) => {
+                for segment in reader {
+                    let seg = segment.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    let index = element_segments;
+                    element_segments += 1;
+                    raw_element_segments.push(parse_element_segment(index, seg));
+                }
+            }
+            Payload::StartSection { func, .. } => {
+                start_func = Some(func);
+            }
+            Payload::CodeSectionEntry(body) => {
+                // Body metrics are collected here and resolved after the loop,
+                // because function-index resolution needs the complete index
+                // space (imports first, then defined functions).
+                raw_code_bodies.push(body);
             }
             _ => {}
         }
+    }
+
+    // Resolve exports now that every index space is fully known. WASM index
+    // spaces are: imported items first (in import order), then locally
+    // defined items. An export index therefore selects from the concatenated
+    // space, not from the defined-only vectors.
+    for (name, kind, index) in export_refs {
+        let mut entry = ExportEntry {
+            name,
+            kind: kind.to_string(),
+            index,
+            type_sig: None,
+            type_index: None,
+            memory: None,
+            table: None,
+            global: None,
+        };
+        match kind {
+            "function" => {
+                // Function index space: imported funcs, then defined funcs
+                // (whose type index lives in `func_type_idx`).
+                let type_idx = {
+                    let i = index as usize;
+                    if i < imported_func_type_idx.len() {
+                        Some(imported_func_type_idx[i])
+                    } else {
+                        func_type_idx.get(i - imported_func_type_idx.len()).copied()
+                    }
+                };
+                entry.type_index = type_idx;
+                entry.type_sig = type_idx.and_then(|t| types.get(t as usize).cloned());
+            }
+            "memory" => {
+                let i = index as usize;
+                entry.memory = if i < imported_memories.len() {
+                    Some(imported_memories[i].clone())
+                } else {
+                    memories.get(i - imported_memories.len()).cloned()
+                };
+            }
+            "table" => {
+                let i = index as usize;
+                entry.table = if i < imported_tables.len() {
+                    Some(imported_tables[i].clone())
+                } else {
+                    tables.get(i - imported_tables.len()).cloned()
+                };
+            }
+            "global" => {
+                let i = index as usize;
+                entry.global = if i < imported_globals.len() {
+                    Some(imported_globals[i].clone())
+                } else {
+                    globals.get(i - imported_globals.len()).cloned()
+                };
+            }
+            _ => {}
+        }
+        report.exports.push(entry);
+    }
+
+    // Resolve the start function now that every index space is fully known.
+    // Same index-space rule as exports: imported functions occupy the lowest
+    // indices, then defined functions in declaration order.
+    let start_function = start_func.map(|index| {
+        let i = index as usize;
+        let mut detail = StartFunction {
+            index,
+            resolution: "invalid".to_string(),
+            import: None,
+            function: None,
+        };
+        if i < imported_func_type_idx.len() {
+            // Resolves to an imported function: report which import.
+            let mut count = 0usize;
+            for imp in &report.imports {
+                if imp.kind == "function" {
+                    if count == i {
+                        detail.resolution = "imported".to_string();
+                        detail.import = Some(ImportRef {
+                            module: imp.module.clone(),
+                            name: imp.name.clone(),
+                        });
+                        break;
+                    }
+                    count += 1;
+                }
+            }
+        } else if let Some(local) = i.checked_sub(imported_func_type_idx.len()) {
+            if let Some(type_idx) = func_type_idx.get(local) {
+                detail.resolution = "defined".to_string();
+                detail.function = Some(StartFunctionSig {
+                    declared_index: local as u32,
+                    signature: types
+                        .get(*type_idx as usize)
+                        .cloned()
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                });
+            }
+        }
+        detail
+    });
+
+    // Resolve element segments now that every index space is fully known.
+    // Same index-space rule as exports and the start function: imported
+    // functions occupy the lowest indices, then defined functions in
+    // declaration order.
+    let element_segment_details: Vec<ElementSegment> = raw_element_segments
+        .into_iter()
+        .map(|raw| {
+            resolve_element_segment(
+                raw,
+                &imported_func_type_idx,
+                &func_type_idx,
+                &report.imports,
+                &types,
+            )
+        })
+        .collect();
+
+    // Resolve code-body metrics now that every index space is fully known.
+    // Same index-space rule as exports: imported functions occupy the lowest
+    // indices, then defined functions in declaration order. Only defined
+    // functions have bodies in the module; imports carry no code here.
+    let imported_func_count = imported_func_type_idx.len();
+    report.code_body_metrics = raw_code_bodies
+        .into_iter()
+        .enumerate()
+        .map(|(defined_index, body)| {
+            let function_index = imported_func_count as u64 + defined_index as u64;
+            let function_index = u32::try_from(function_index)
+                .map_err(|_| InspectError::Malformed("function index overflow".to_string()))?;
+            let signature = func_type_idx
+                .get(defined_index)
+                .and_then(|t| types.get(*t as usize).cloned());
+            let metrics = measure_code_body(body).map_err(InspectError::Malformed)?;
+            Ok(CodeBodyMetrics {
+                defined_index,
+                function_index,
+                signature,
+                body_len_bytes: metrics.body_len_bytes,
+                local_decl_count: metrics.local_decl_count,
+                local_total: metrics.local_total,
+                operator_count: metrics.operator_count,
+                max_control_depth: metrics.max_control_depth,
+                instruction_inventory: metrics
+                    .instruction_inventory
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, InspectError>>()?;
+
+    // Emit the structure summary only when the module declares any of these
+    // items, so modules without them keep the previous JSON shape.
+    if !memories.is_empty()
+        || !tables.is_empty()
+        || !globals.is_empty()
+        || data_segments > 0
+        || element_segments > 0
+        || start_func.is_some()
+    {
+        report.structure = Some(ModuleStructure {
+            memories,
+            tables,
+            globals,
+            data_segments,
+            data_segment_details,
+            element_segments,
+            element_segment_details,
+            start_func,
+            start_function,
+        });
     }
 
     // Build function signatures: imported funcs come first in the index space.
@@ -192,7 +2098,253 @@ pub fn inspect(bytes: &[u8], validate: bool) -> Result<WasmReport, InspectError>
             .map_err(|e| InspectError::Malformed(format!("validation failed: {e}")))?;
     }
 
+    // Interface summary is derived from the resolved import/export vectors, so
+    // it is built last and never touches the raw bytes.
+    report.interface = Some(build_interface_summary(&report));
+
     Ok(report)
+}
+
+/// Build the developer-facing interface summary from an already-resolved
+/// report.
+///
+/// This is a pure derivation: it reads only `report.imports` and
+/// `report.exports`, never the raw bytes, so it can neither reparse the module
+/// nor re-do index resolution. Missing signatures stay `None` (reported as
+/// unavailable) rather than being guessed.
+pub fn build_interface_summary(report: &WasmReport) -> InterfaceSummary {
+    let count_by_kind = |entries: Vec<&str>| -> Vec<KindCount> {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for kind in entries {
+            *counts.entry(kind).or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(kind, count)| KindCount {
+                kind: kind.to_string(),
+                count,
+            })
+            .collect()
+    };
+
+    let imports_by_kind = count_by_kind(report.imports.iter().map(|i| i.kind.as_str()).collect());
+    let exports_by_kind = count_by_kind(report.exports.iter().map(|e| e.kind.as_str()).collect());
+
+    let exported_functions: Vec<ExportedFunction> = report
+        .exports
+        .iter()
+        .filter(|e| e.kind == "function")
+        .map(|e| ExportedFunction {
+            name: e.name.clone(),
+            index: e.index,
+            signature: e.type_sig.clone(),
+        })
+        .collect();
+
+    let imported_functions: Vec<ImportedFunction> = report
+        .imports
+        .iter()
+        .filter(|i| i.kind == "function")
+        .map(|i| ImportedFunction {
+            module: i.module.clone(),
+            name: i.name.clone(),
+            signature: i.type_sig.clone(),
+        })
+        .collect();
+
+    let exports: Vec<ExportNameKind> = report
+        .exports
+        .iter()
+        .map(|e| ExportNameKind {
+            name: e.name.clone(),
+            kind: e.kind.clone(),
+        })
+        .collect();
+
+    InterfaceSummary {
+        imports_by_kind,
+        exports_by_kind,
+        exported_functions,
+        imported_functions,
+        exports,
+        has_contract_spec: report
+            .custom_sections
+            .iter()
+            .any(|s| s.name == "contractspecv0"),
+    }
+}
+
+/// Run resource + compatibility analysis on a WASM module.
+///
+/// Resource reporting splits imported vs defined resources and distinguishes
+/// unavailable limits (None) from unlimited. Compatibility findings are based
+/// only on Soroban host pre-validation (default `wasmparser::validate` features
+/// per `soroban-env-host`) plus the known float rejection. Anything not covered
+/// by those rules is reported as `unknown`, never guessed.
+///
+/// # Errors
+/// Propagates generic WASM parse errors. Analysis itself never panics on
+/// well-formed modules.
+pub fn analyze(bytes: &[u8]) -> Result<Analysis, InspectError> {
+    let mut imported_memories = Vec::new();
+    let mut imported_tables = Vec::new();
+    let mut imported_globals = Vec::new();
+    let mut defined_memories: Vec<MemoryBounds> = Vec::new();
+    let mut defined_tables: Vec<TableBounds> = Vec::new();
+    let mut defined_globals: Vec<GlobalEntry> = Vec::new();
+    let mut func_count: usize = 0;
+    let mut data_segment_count: usize = 0;
+    let mut element_segment_count: usize = 0;
+    let mut findings: Vec<Finding> = Vec::new();
+
+    let mut seen_memory64 = false;
+
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| InspectError::Malformed(e.to_string()))?;
+        match payload {
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    let label = format!("{}::{}", import.module, import.name);
+                    match import.ty {
+                        TypeRef::Func(_) => func_count += 1,
+                        TypeRef::Table(_) => imported_tables.push(label),
+                        TypeRef::Memory(_) => imported_memories.push(label),
+                        TypeRef::Global(_) => imported_globals.push(label),
+                        TypeRef::Tag(_) => {}
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for f in reader {
+                    f.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    func_count += 1;
+                }
+            }
+            Payload::MemorySection(reader) => {
+                for mem in reader {
+                    let mem = mem.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    if mem.memory64 {
+                        seen_memory64 = true;
+                    }
+                    defined_memories.push(MemoryBounds {
+                        min_pages: mem.initial,
+                        max_pages: mem.maximum,
+                        is64: mem.memory64,
+                        shared: mem.shared,
+                    });
+                }
+            }
+            Payload::TableSection(reader) => {
+                for table in reader {
+                    let table = table.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    defined_tables.push(TableBounds {
+                        element_type: format!("{:?}", table.ty.element_type),
+                        min_size: u64::from(table.ty.initial),
+                        max_size: table.ty.maximum.map(u64::from),
+                    });
+                }
+            }
+            Payload::GlobalSection(reader) => {
+                for global in reader {
+                    let global = global.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    defined_globals.push(GlobalEntry {
+                        mutable: global.ty.mutable,
+                        value_type: format!("{:?}", global.ty.content_type),
+                    });
+                }
+            }
+            Payload::DataSection(reader) => {
+                for segment in reader {
+                    segment.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    data_segment_count += 1;
+                }
+            }
+            Payload::ElementSection(reader) => {
+                for segment in reader {
+                    segment.map_err(|e| InspectError::Malformed(e.to_string()))?;
+                    element_segment_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Float detection: Soroban host pre-validates with default wasmparser
+    // features (soroban-env-host 28.0.2, parsed_module.rs:303), and the e2e
+    // test suite confirms float WASM is rejected (e2e_tests.rs:818). We probe
+    // by validating with `floats: false` — if the module passes default
+    // validation but fails without floats, it uses float ops.
+    let mut seen_float_op = false;
+    let mut float_probe_ran = false;
+    {
+        let default_ok = Validator::new_with_features(WasmFeatures::all())
+            .validate_all(bytes)
+            .is_ok();
+        if default_ok {
+            float_probe_ran = true;
+            let no_floats = WasmFeatures {
+                floats: false,
+                ..WasmFeatures::all()
+            };
+            let no_floats_result = Validator::new_with_features(no_floats).validate_all(bytes);
+            if no_floats_result.is_err() {
+                seen_float_op = true;
+            }
+        }
+    }
+
+    if seen_float_op {
+        findings.push(Finding {
+            code: "float_ops".to_string(),
+            severity: "incompatible".to_string(),
+            message: "Floating-point operations detected. Soroban host rejects WASM with float instructions (f32/f64 load/store/const/arithmetic/comparison).".to_string(),
+        });
+    }
+
+    if seen_memory64 {
+        findings.push(Finding {
+            code: "memory64".to_string(),
+            severity: "unsupported".to_string(),
+            message: "64-bit memory (memory64) detected. Soroban host pre-validates with default wasmparser features (memory64 disabled).".to_string(),
+        });
+    }
+
+    // Coverage: which areas ran a rule vs which have no implemented rule.
+    // `checked` is sorted for deterministic output. `not_checked` names every
+    // compatibility area the repository has no verified Soroban rule for.
+    let mut checked: Vec<String> = Vec::new();
+    if float_probe_ran {
+        checked.push("float_ops".to_string());
+    }
+    checked.sort();
+    let coverage = Coverage {
+        checked,
+        not_checked: vec![
+            "component_model".to_string(),
+            "exceptions".to_string(),
+            "gc".to_string(),
+            "memory64".to_string(),
+            "multi_memory".to_string(),
+            "simd".to_string(),
+            "tail_calls".to_string(),
+            "threads".to_string(),
+        ],
+    };
+
+    Ok(Analysis {
+        imported_memories,
+        defined_memories,
+        imported_tables,
+        defined_tables,
+        imported_globals,
+        defined_globals,
+        function_count: func_count,
+        data_segment_count,
+        element_segment_count,
+        findings,
+        coverage,
+    })
 }
 
 /// Flatten a `RecGroup` into per-type signature strings, appended to `out`.
@@ -252,5 +2404,1608 @@ mod tests {
     fn empty_module_validates() {
         let report = inspect(EMPTY_WASM, true).unwrap();
         assert_eq!(report.size_bytes, 8);
+    }
+
+    /// Build a module with a memory section: one memory, min 2 pages, max 4.
+    fn module_with_memory() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Memory section (id 5), 1 entry, limits flag 0x01 (has max), min 2, max 4.
+        b.extend_from_slice(&[0x05, 0x04, 0x01, 0x01, 0x02, 0x04]);
+        b
+    }
+
+    #[test]
+    fn memory_section_is_reported() {
+        let report = inspect(&module_with_memory(), false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.memories.len(), 1);
+        assert_eq!(s.memories[0].min_pages, 2);
+        assert_eq!(s.memories[0].max_pages, Some(4));
+        assert!(!s.memories[0].is64);
+        assert!(s.tables.is_empty());
+        assert!(s.globals.is_empty());
+    }
+
+    /// Build a module with a global section: one immutable i32 global.
+    fn module_with_global() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Global section (id 6), 1 entry: i32 (0x7f), immutable (0x00),
+        // init expr i32.const 0 (0x41 0x00), end (0x0b).
+        b.extend_from_slice(&[0x06, 0x06, 0x01, 0x7f, 0x00, 0x41, 0x00, 0x0b]);
+        b
+    }
+
+    #[test]
+    fn global_section_is_reported() {
+        let report = inspect(&module_with_global(), false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.globals.len(), 1);
+        assert!(!s.globals[0].mutable);
+        assert_eq!(s.globals[0].value_type, "I32");
+        assert!(s.memories.is_empty());
+    }
+
+    #[test]
+    fn structure_absent_for_empty_module() {
+        // No memory/table/global/segment/start → structure must stay None so
+        // the JSON shape for bare modules is unchanged.
+        let report = inspect(EMPTY_WASM, false).unwrap();
+        assert!(report.structure.is_none());
+    }
+
+    #[test]
+    fn structure_absent_for_malformed_module() {
+        let result = inspect(&[0xff, 0xff, 0xff], false);
+        assert!(result.is_err());
+    }
+
+    // --- Import detail tests ---
+
+    /// Build a module with one imported function.
+    fn module_with_imported_func() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Type section: 1 type, () -> ()
+        b.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]);
+        // Import section: 1 import "env"::"add" func type 0
+        b.extend_from_slice(&[
+            0x02, 0x0b, 0x01, // section id 2, len 11, count 1
+            0x03, b'e', b'n', b'v', // module "env" (len 3)
+            0x03, b'a', b'd', b'd', // name "add" (len 3)
+            0x00, 0x00, // kind func, type index 0
+        ]);
+        b
+    }
+
+    #[test]
+    fn imported_function_has_type_index_and_sig() {
+        let report = inspect(&module_with_imported_func(), false).unwrap();
+        assert_eq!(report.imports.len(), 1);
+        let imp = &report.imports[0];
+        assert_eq!(imp.kind, "function");
+        assert_eq!(imp.module, "env");
+        assert_eq!(imp.name, "add");
+        assert_eq!(imp.type_index, Some(0));
+        assert!(imp.type_sig.is_some());
+        assert!(imp.memory.is_none());
+        assert!(imp.table.is_none());
+        assert!(imp.global.is_none());
+    }
+
+    /// Build a module with one imported memory (min 1, no max).
+    fn module_with_imported_memory() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Import section: 1 import "env"::"mem" memory, limits flag 0x00, min 1
+        b.extend_from_slice(&[
+            0x02, 0x0c, 0x01, // section id 2, len 12, count 1
+            0x03, b'e', b'n', b'v', // module "env"
+            0x03, b'm', b'e', b'm', // name "mem"
+            0x02, 0x00, 0x01, // kind memory, limits flag 0x00 (no max), min 1
+        ]);
+        b
+    }
+
+    #[test]
+    fn imported_memory_has_bounds_no_max() {
+        let report = inspect(&module_with_imported_memory(), false).unwrap();
+        assert_eq!(report.imports.len(), 1);
+        let imp = &report.imports[0];
+        assert_eq!(imp.kind, "memory");
+        let mem = imp.memory.as_ref().expect("memory details present");
+        assert_eq!(mem.min_pages, 1);
+        assert_eq!(mem.max_pages, None, "no max declared → None, not Some(0)");
+        assert!(!mem.is64);
+        assert!(imp.type_sig.is_none());
+        assert!(imp.table.is_none());
+        assert!(imp.global.is_none());
+    }
+
+    /// Build a module with one imported memory with max (limits flag 0x01).
+    fn module_with_imported_memory_max() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[
+            0x02, 0x0d, 0x01, // section id 2, len 13, count 1
+            0x03, b'e', b'n', b'v', // module "env"
+            0x03, b'm', b'e', b'm', // name "mem"
+            0x02, 0x01, 0x02, 0x04, // kind memory, limits flag 0x01 (has max), min 2, max 4
+        ]);
+        b
+    }
+
+    #[test]
+    fn imported_memory_with_max() {
+        let report = inspect(&module_with_imported_memory_max(), false).unwrap();
+        let imp = &report.imports[0];
+        let mem = imp.memory.as_ref().expect("memory details present");
+        assert_eq!(mem.min_pages, 2);
+        assert_eq!(mem.max_pages, Some(4));
+    }
+
+    /// Build a module with one imported table (funcref, min 1, no max).
+    fn module_with_imported_table() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Import section: 1 import "env"::"tbl" table, funcref, limits flag 0x00, min 1
+        b.extend_from_slice(&[
+            0x02, 0x0d, 0x01, // section id 2, len 13, count 1
+            0x03, b'e', b'n', b'v', // module "env"
+            0x03, b't', b'l', b'l', // name "tbl"
+            0x01, 0x70, 0x00,
+            0x01, // kind table, elem type funcref (0x70), limits flag 0x00, min 1
+        ]);
+        b
+    }
+
+    #[test]
+    fn imported_table_has_element_type_and_bounds() {
+        let report = inspect(&module_with_imported_table(), false).unwrap();
+        let imp = &report.imports[0];
+        assert_eq!(imp.kind, "table");
+        let tbl = imp.table.as_ref().expect("table details present");
+        assert_eq!(tbl.element_type, "funcref");
+        assert_eq!(tbl.min_size, 1);
+        assert_eq!(tbl.max_size, None);
+        assert!(imp.memory.is_none());
+        assert!(imp.global.is_none());
+    }
+
+    /// Build a module with one imported global (i32, immutable).
+    fn module_with_imported_global() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Import section: 1 import "env"::"g" global, i32 (0x7f), immutable (0x00)
+        b.extend_from_slice(&[
+            0x02, 0x0a, 0x01, // section id 2, len 10, count 1
+            0x03, b'e', b'n', b'v', // module "env"
+            0x01, b'g', // name "g"
+            0x03, 0x7f, 0x00, // kind global, i32, immutable
+        ]);
+        b
+    }
+
+    #[test]
+    fn imported_global_has_type_and_mutability() {
+        let report = inspect(&module_with_imported_global(), false).unwrap();
+        let imp = &report.imports[0];
+        assert_eq!(imp.kind, "global");
+        let g = imp.global.as_ref().expect("global details present");
+        assert_eq!(g.value_type, "I32");
+        assert!(!g.mutable);
+        assert!(imp.memory.is_none());
+        assert!(imp.table.is_none());
+    }
+
+    /// Build a module with one imported global (i64, mutable).
+    fn module_with_imported_mutable_global() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[
+            0x02, 0x0a, 0x01, // section id 2, len 10, count 1
+            0x03, b'e', b'n', b'v', // module "env"
+            0x01, b'g', // name "g"
+            0x03, 0x7e, 0x01, // kind global, i64 (0x7e), mutable (0x01)
+        ]);
+        b
+    }
+
+    #[test]
+    fn imported_mutable_i64_global() {
+        let report = inspect(&module_with_imported_mutable_global(), false).unwrap();
+        let imp = &report.imports[0];
+        let g = imp.global.as_ref().expect("global details present");
+        assert_eq!(g.value_type, "I64");
+        assert!(g.mutable);
+    }
+
+    #[test]
+    fn imported_memory64_flag_detected() {
+        // Import memory with limits flag 0x05 (memory64 + has max), min 2 max 4.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[
+            0x02, 0x0d, 0x01, // section id 2, len 13, count 1
+            0x03, b'e', b'n', b'v', // module "env"
+            0x03, b'm', b'e', b'm', // name "mem"
+            0x02, 0x05, 0x02,
+            0x04, // kind memory, limits flag 0x05 (memory64+max), min 2, max 4
+        ]);
+        let report = inspect(&b, false).unwrap();
+        let imp = &report.imports[0];
+        let mem = imp.memory.as_ref().expect("memory details present");
+        assert!(mem.is64, "memory64 flag must be detected");
+        assert_eq!(mem.min_pages, 2);
+        assert_eq!(mem.max_pages, Some(4));
+    }
+
+    #[test]
+    fn empty_module_has_no_imports() {
+        let report = inspect(EMPTY_WASM, false).unwrap();
+        assert!(report.imports.is_empty());
+    }
+
+    #[test]
+    fn imported_shared_memory_flag_detected() {
+        // Import memory with limits flag 0x03 (shared + has max), min 1 max 2.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[
+            0x02, 0x0d, 0x01, // section id 2, len 13, count 1
+            0x03, b'e', b'n', b'v', // module "env"
+            0x03, b'm', b'e', b'm', // name "mem"
+            0x02, 0x03, 0x01, 0x02, // kind memory, limits flag 0x03, min 1, max 2
+        ]);
+        let report = inspect(&b, false).unwrap();
+        let mem = report.imports[0].memory.as_ref().expect("memory details");
+        assert!(mem.shared, "shared flag must be detected");
+        assert!(!mem.is64);
+        assert_eq!(mem.min_pages, 1);
+        assert_eq!(mem.max_pages, Some(2));
+    }
+
+    // --- Start function tests ---
+
+    /// A type section with `n` distinct `() -> ()` types.
+    fn type_section(n: usize) -> Vec<u8> {
+        let mut payload = vec![n as u8];
+        for _ in 0..n {
+            payload.extend_from_slice(&[0x60, 0x00, 0x00]);
+        }
+        let mut b = vec![0x01, payload.len() as u8];
+        b.extend_from_slice(&payload);
+        b
+    }
+
+    /// A code section declaring `n` functions, each with an empty body.
+    fn code_section(n: usize) -> Vec<u8> {
+        let mut payload = vec![n as u8];
+        for _ in 0..n {
+            // body: 0 locals, 0x0b (end) → body size 2
+            payload.extend_from_slice(&[0x02, 0x00, 0x0b]);
+        }
+        let mut b = vec![0x0a, payload.len() as u8];
+        b.extend_from_slice(&payload);
+        b
+    }
+
+    /// A function section declaring `n` functions, all of type index 0.
+    fn function_section(n: usize) -> Vec<u8> {
+        let mut payload = vec![n as u8];
+        payload.extend(std::iter::repeat_n(0u8, n));
+        let mut b = vec![0x03, payload.len() as u8];
+        b.extend_from_slice(&payload);
+        b
+    }
+
+    /// An import section with one function import `"env"::"add"` of type 0.
+    fn one_imported_func() -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        let mut payload = vec![0x01];
+        payload.push(0x03);
+        payload.extend_from_slice(b"env");
+        payload.push(0x03);
+        payload.extend_from_slice(b"add");
+        payload.extend_from_slice(&[0x00, 0x00]);
+        b.push(0x02);
+        b.push(payload.len() as u8);
+        b.extend_from_slice(&payload);
+        b
+    }
+
+    #[test]
+    fn module_without_start_section_reports_none() {
+        // Absence must not be represented as index 0.
+        let report = inspect(EMPTY_WASM, false).unwrap();
+        assert!(report.structure.is_none());
+        let mut b = one_imported_func();
+        b.extend_from_slice(&function_section(1));
+        b.extend_from_slice(&code_section(1));
+        // Add a memory so the structure summary is emitted (functions alone
+        // do not trigger it); the start section stays absent.
+        b.extend_from_slice(&[0x05, 0x03, 0x01, 0x00, 0x01]);
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.start_func, None, "no start section → None, not Some(0)");
+        assert!(
+            s.start_function.is_none(),
+            "no start section → no resolved detail"
+        );
+    }
+
+    #[test]
+    fn start_function_resolves_to_imported_function() {
+        // One imported function (index 0) + start section pointing at index 0.
+        let mut b = one_imported_func();
+        b.extend_from_slice(&[0x08, 0x01, 0x00]); // start section, func index 0
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.start_func, Some(0));
+        let sf = s.start_function.expect("start function detail present");
+        assert_eq!(sf.index, 0);
+        assert_eq!(sf.resolution, "imported");
+        let imp = sf.import.expect("import reference present");
+        assert_eq!(imp.module, "env");
+        assert_eq!(imp.name, "add");
+        assert!(
+            sf.function.is_none(),
+            "imported → no defined-function detail"
+        );
+    }
+
+    #[test]
+    fn start_function_resolves_to_defined_function() {
+        // One imported function (index 0) + one defined function (index 1),
+        // start points at index 1.
+        let mut b = one_imported_func();
+        b.extend_from_slice(&function_section(1));
+        b.extend_from_slice(&code_section(1));
+        b.extend_from_slice(&[0x08, 0x01, 0x01]); // start → func index 1
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.start_func, Some(1));
+        let sf = s.start_function.expect("start function detail present");
+        assert_eq!(sf.index, 1);
+        assert_eq!(sf.resolution, "defined");
+        let f = sf.function.expect("defined-function detail present");
+        assert_eq!(
+            f.declared_index, 0,
+            "defined index is 0-based among defined"
+        );
+        assert!(
+            f.signature.contains("->"),
+            "signature must be resolved, got {}",
+            f.signature
+        );
+        assert!(sf.import.is_none(), "defined → no import reference");
+    }
+
+    #[test]
+    fn start_function_index_accounts_for_imported_functions() {
+        // Two imported functions (indices 0,1) + one defined function
+        // (index 2). Start points at 2 → must resolve to the DEFINED
+        // function, not the second import.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        let mut payload = vec![0x02];
+        for name in [b"add".as_slice(), b"sub".as_slice()] {
+            payload.push(0x03);
+            payload.extend_from_slice(b"env");
+            payload.push(name.len() as u8);
+            payload.extend_from_slice(name);
+            payload.extend_from_slice(&[0x00, 0x00]);
+        }
+        b.push(0x02);
+        b.push(payload.len() as u8);
+        b.extend_from_slice(&payload);
+        b.extend_from_slice(&function_section(1));
+        b.extend_from_slice(&code_section(1));
+        b.extend_from_slice(&[0x08, 0x01, 0x02]); // start → func index 2
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let sf = s.start_function.expect("start function detail present");
+        assert_eq!(sf.index, 2);
+        assert_eq!(
+            sf.resolution, "defined",
+            "index 2 with 2 imports must be the defined function"
+        );
+        let f = sf.function.expect("defined-function detail");
+        assert_eq!(f.declared_index, 0);
+    }
+
+    #[test]
+    fn start_function_out_of_range_is_invalid_not_panicking() {
+        // Start points at index 9 but only one imported function exists.
+        let mut b = one_imported_func();
+        b.extend_from_slice(&[0x08, 0x01, 0x09]);
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let sf = s.start_function.expect("start function detail present");
+        assert_eq!(sf.index, 9);
+        assert_eq!(sf.resolution, "invalid");
+        assert!(sf.import.is_none());
+        assert!(sf.function.is_none());
+    }
+
+    #[test]
+    fn malformed_start_section_is_rejected() {
+        // Start section with a truncated body: section length 1 but no index.
+        let mut b = one_imported_func();
+        b.extend_from_slice(&[0x08, 0x01]);
+        let result = inspect(&b, false);
+        assert!(
+            result.is_err(),
+            "malformed start section must be rejected like other malformed input"
+        );
+    }
+
+    // --- Data segment tests ---
+
+    /// Encode a LEB128 unsigned integer.
+    fn leb(n: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut n = n;
+        loop {
+            let mut v = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                v |= 0x80;
+            }
+            out.push(v);
+            if n == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Build a module with a defined memory (min 1 page) and the given
+    /// data-segment bodies. Each body is the raw content of one segment
+    /// (mode + offset + payload). Section lengths are computed, never
+    /// hand-counted.
+    fn module_with_data_segments(segments: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        // Memory section (id 5): one memory, min 1 page.
+        b.extend_from_slice(&[0x05, 0x03, 0x01, 0x00, 0x01]);
+        // Data section (id 0x0b): count + bodies.
+        let mut content = Vec::new();
+        content.extend_from_slice(&leb(segments.len() as u32));
+        for seg in segments {
+            content.extend_from_slice(seg);
+        }
+        b.push(0x0b);
+        b.extend_from_slice(&leb(content.len() as u32));
+        b.extend_from_slice(&content);
+        b
+    }
+
+    /// An active data segment body: memidx 0, `i32.const <off>`, payload.
+    fn active_segment(off: i32, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00]; // flags 0x00 → active, memory index 0
+        v.push(0x41); // i32.const
+        v.extend_from_slice(&leb(off as u32));
+        v.push(0x0b); // end
+        v.extend_from_slice(&leb(payload.len() as u32));
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// A passive data segment body: flags 0x01, payload.
+    fn passive_segment(payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x01]; // flags 0x01 → passive
+        v.extend_from_slice(&leb(payload.len() as u32));
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// An active segment with an explicit non-zero memory index.
+    fn active_segment_memidx(memidx: u32, off: i32, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x02]; // flags 0x02 → active, explicit memory index
+        v.extend_from_slice(&leb(memidx));
+        v.push(0x41);
+        v.extend_from_slice(&leb(off as u32));
+        v.push(0x0b);
+        v.extend_from_slice(&leb(payload.len() as u32));
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn active_segment_targets_memory_zero() {
+        let wasm = module_with_data_segments(&[active_segment(42, b"hi")]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.data_segments, 1);
+        assert_eq!(s.data_segment_details.len(), 1);
+        let seg = &s.data_segment_details[0];
+        assert_eq!(seg.index, 0);
+        assert_eq!(seg.mode, DataSegmentMode::Active);
+        assert_eq!(seg.memory_index, Some(0));
+        assert_eq!(
+            seg.offset,
+            Some(OffsetExpr::Const { value: 42 }),
+            "i32.const offset must be reported as a value"
+        );
+        assert_eq!(seg.payload_len, 2);
+    }
+
+    #[test]
+    fn passive_segment_has_no_memory_or_offset() {
+        let wasm = module_with_data_segments(&[passive_segment(b"abc")]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.data_segment_details[0];
+        assert_eq!(seg.mode, DataSegmentMode::Passive);
+        assert!(
+            seg.memory_index.is_none(),
+            "passive segments carry no memory index"
+        );
+        assert!(seg.offset.is_none(), "passive segments carry no offset");
+        assert_eq!(seg.payload_len, 3);
+    }
+
+    #[test]
+    fn empty_and_non_empty_payloads() {
+        let wasm = module_with_data_segments(&[active_segment(0, b""), passive_segment(b"xyz")]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.data_segment_details[0].payload_len, 0);
+        assert_eq!(s.data_segment_details[1].payload_len, 3);
+    }
+
+    #[test]
+    fn active_segment_with_explicit_memory_index() {
+        let wasm = module_with_data_segments(&[active_segment_memidx(3, 7, b"z")]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.data_segment_details[0];
+        assert_eq!(seg.memory_index, Some(3));
+        assert_eq!(seg.offset, Some(OffsetExpr::Const { value: 7 }));
+    }
+
+    #[test]
+    fn multiple_segments_preserve_declaration_order() {
+        let wasm = module_with_data_segments(&[
+            active_segment(10, b"first"),
+            passive_segment(b"second"),
+            active_segment(20, b"third"),
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.data_segments, 3);
+        assert_eq!(s.data_segment_details.len(), 3);
+        assert_eq!(s.data_segment_details[0].index, 0);
+        assert_eq!(s.data_segment_details[1].index, 1);
+        assert_eq!(s.data_segment_details[2].index, 2);
+        assert_eq!(s.data_segment_details[0].mode, DataSegmentMode::Active);
+        assert_eq!(s.data_segment_details[1].mode, DataSegmentMode::Passive);
+        assert_eq!(s.data_segment_details[2].mode, DataSegmentMode::Active);
+    }
+
+    #[test]
+    fn global_get_offset_is_reported_as_reference_not_value() {
+        // Active segment whose offset is `global.get 0` — the global's value
+        // is not evaluated, so it must not appear as a Const.
+        let mut body = vec![0x00]; // active, memidx 0
+        body.push(0x23); // global.get
+        body.extend_from_slice(&leb(0));
+        body.push(0x0b); // end
+        body.extend_from_slice(&leb(1));
+        body.push(0xff);
+        let wasm = module_with_data_segments(&[body]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.data_segment_details[0];
+        assert_eq!(
+            seg.offset,
+            Some(OffsetExpr::GlobalGet { global_index: 0 }),
+            "global.get must be a reference, never an invented value"
+        );
+    }
+
+    #[test]
+    fn unsupported_offset_expression_is_reported_not_guessed() {
+        // Active segment whose offset is `i64.const` — a valid constant but
+        // not one of the supported forms, so it must be Unsupported with a
+        // reason rather than an invented number.
+        let mut body = vec![0x00]; // active, memidx 0
+        body.push(0x42); // i64.const
+        body.extend_from_slice(&leb(9));
+        body.push(0x0b); // end
+        body.extend_from_slice(&leb(0));
+        let wasm = module_with_data_segments(&[body]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.data_segment_details[0];
+        match &seg.offset {
+            Some(OffsetExpr::Const { value }) => {
+                // i64.const is a supported single-instruction constant form.
+                assert_eq!(*value, 9);
+            }
+            other => panic!("expected Const for i64.const, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_data_section_reports_empty_details() {
+        // A module with a memory but no data section: the details list must
+        // be empty and the existing count must stay zero.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[0x05, 0x03, 0x01, 0x00, 0x01]);
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.data_segments, 0);
+        assert!(s.data_segment_details.is_empty());
+    }
+
+    #[test]
+    fn malformed_data_section_is_rejected() {
+        // Data section with an invalid flags byte (0x05) for the first
+        // segment — rejected as malformed, consistent with the parser.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[0x05, 0x03, 0x01, 0x00, 0x01]);
+        // Data section: count 1, then flags 0x05 (invalid).
+        let content = vec![0x01, 0x05];
+        b.push(0x0b);
+        b.extend_from_slice(&leb(content.len() as u32));
+        b.extend_from_slice(&content);
+        let result = inspect(&b, false);
+        assert!(
+            result.is_err(),
+            "invalid data segment flags must be rejected like other malformed input"
+        );
+    }
+
+    // --- Element segment tests ---
+
+    /// Build a module with a defined table (funcref, min 4) and the given
+    /// element-segment bodies (one segment per element).
+    fn module_with_element_segments(segments: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&table_section_bytes());
+        let mut content = Vec::new();
+        content.extend_from_slice(&leb(segments.len() as u32));
+        for seg in segments {
+            content.extend_from_slice(seg);
+        }
+        b.push(0x09); // element section
+        b.extend_from_slice(&leb(content.len() as u32));
+        b.extend_from_slice(&content);
+        b
+    }
+
+    /// A table section: one funcref table, min 4.
+    fn table_section_bytes() -> Vec<u8> {
+        vec![0x04, 0x04, 0x01, 0x70, 0x00, 0x04]
+    }
+
+    /// Active segment, flags 0x00 (functions, implicit table 0), offset,
+    /// function indices.
+    fn active_elem_funcs(off: i32, idxs: &[u32]) -> Vec<u8> {
+        let mut v = vec![0x00]; // flags 0x00 → active, implicit table 0
+        v.push(0x41); // i32.const
+        v.extend_from_slice(&leb(off as u32));
+        v.push(0x0b); // end
+        v.extend_from_slice(&leb(idxs.len() as u32));
+        for i in idxs {
+            v.extend_from_slice(&leb(*i));
+        }
+        v
+    }
+
+    /// Active segment, flags 0x02 (functions, explicit table index), table,
+    /// offset, function indices.
+    fn active_elem_funcs_table(table: u32, off: i32, idxs: &[u32]) -> Vec<u8> {
+        let mut v = vec![0x02]; // flags 0x02 → active, explicit table index
+        v.extend_from_slice(&leb(table));
+        v.push(0x41); // i32.const
+        v.extend_from_slice(&leb(off as u32));
+        v.push(0x0b); // end
+        v.push(0x00); // ExternalKind::Func (required for function-index form)
+        v.extend_from_slice(&leb(idxs.len() as u32));
+        for i in idxs {
+            v.extend_from_slice(&leb(*i));
+        }
+        v
+    }
+
+    /// Passive segment, flags 0x01 (functions), function indices.
+    fn passive_elem_funcs(idxs: &[u32]) -> Vec<u8> {
+        let mut v = vec![0x01, 0x00]; // flags 0x01, ExternalKind::Func
+        v.extend_from_slice(&leb(idxs.len() as u32));
+        for i in idxs {
+            v.extend_from_slice(&leb(*i));
+        }
+        v
+    }
+
+    /// Declared segment, flags 0x03 (functions), function indices.
+    fn declared_elem_funcs(idxs: &[u32]) -> Vec<u8> {
+        let mut v = vec![0x03, 0x00]; // flags 0x03, ExternalKind::Func
+        v.extend_from_slice(&leb(idxs.len() as u32));
+        for i in idxs {
+            v.extend_from_slice(&leb(*i));
+        }
+        v
+    }
+
+    /// An import section with `n` imported functions, each named `"env"::<name>`,
+    /// all of type 0.
+    fn import_section(names: &[&str]) -> Vec<u8> {
+        let mut payload = vec![names.len() as u8];
+        for name in names {
+            payload.push(0x03);
+            payload.extend_from_slice(b"env");
+            payload.push(name.len() as u8);
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&[0x00, 0x00]); // Func, type 0
+        }
+        let mut b = vec![0x02, payload.len() as u8];
+        b.extend_from_slice(&payload);
+        b
+    }
+
+    /// An element section with the given segment bodies.
+    fn element_section_bytes(segments: &[Vec<u8>]) -> Vec<u8> {
+        let mut content = Vec::new();
+        content.extend_from_slice(&leb(segments.len() as u32));
+        for seg in segments {
+            content.extend_from_slice(seg);
+        }
+        let mut b = vec![0x09]; // element section
+        b.extend_from_slice(&leb(content.len() as u32));
+        b.extend_from_slice(&content);
+        b
+    }
+
+    /// Passive expression segment, flags 0x05, elemtype, count, exprs.
+    fn passive_elem_exprs(ty: u8, exprs: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = vec![0x05, ty]; // flags 0x05, elemtype
+        v.extend_from_slice(&leb(exprs.len() as u32));
+        for e in exprs {
+            v.extend_from_slice(e);
+        }
+        v
+    }
+
+    /// A single-element expression: `ref.func <idx>`.
+    fn expr_ref_func(idx: u32) -> Vec<u8> {
+        let mut v = vec![0xd2];
+        v.extend_from_slice(&leb(idx));
+        v.push(0x0b);
+        v
+    }
+
+    /// A single-element expression: `ref.null <heaptype>`.
+    fn expr_ref_null(hty: u8) -> Vec<u8> {
+        vec![0xd0, hty, 0x0b]
+    }
+
+    #[test]
+    fn no_element_section_reports_empty_details() {
+        // A module with a table but no element section: the details list
+        // must be empty and the count must stay zero.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&table_section_bytes());
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.element_segments, 0);
+        assert!(s.element_segment_details.is_empty());
+    }
+
+    #[test]
+    fn active_segment_targets_table_zero() {
+        // Active segment, implicit table 0, offset i32.const 16, two
+        // function indices [0, 1].
+        let wasm = module_with_element_segments(&[active_elem_funcs(16, &[0, 1])]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.element_segments, 1);
+        assert_eq!(s.element_segment_details.len(), 1);
+        let seg = &s.element_segment_details[0];
+        assert_eq!(seg.index, 0);
+        assert_eq!(seg.mode, ElementSegmentMode::Active);
+        assert_eq!(seg.table_index, Some(0));
+        assert_eq!(seg.kind, ElementKind::Functions);
+        assert_eq!(seg.element_count, 2);
+        assert_eq!(
+            seg.offset,
+            Some(OffsetExpr::Const { value: 16 }),
+            "i32.const offset must be reported as a value"
+        );
+        assert_eq!(seg.items.len(), 2);
+    }
+
+    #[test]
+    fn active_segment_with_explicit_table_index() {
+        // Active segment, explicit table index 3.
+        let wasm = module_with_element_segments(&[active_elem_funcs_table(3, 7, &[0])]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.element_segment_details[0];
+        assert_eq!(seg.table_index, Some(3), "explicit table index preserved");
+        assert_eq!(seg.offset, Some(OffsetExpr::Const { value: 7 }),);
+    }
+
+    #[test]
+    fn passive_mode() {
+        // Passive segment with one function index.
+        let wasm = module_with_element_segments(&[passive_elem_funcs(&[0])]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.element_segment_details[0];
+        assert_eq!(seg.mode, ElementSegmentMode::Passive);
+        assert!(seg.table_index.is_none(), "passive has no table index");
+        assert!(seg.offset.is_none(), "passive has no offset");
+    }
+
+    #[test]
+    fn declared_mode() {
+        // Declared segment with one function index.
+        let wasm = module_with_element_segments(&[declared_elem_funcs(&[0])]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.element_segment_details[0];
+        assert_eq!(seg.mode, ElementSegmentMode::Declared);
+        assert!(seg.table_index.is_none());
+        assert!(seg.offset.is_none());
+    }
+
+    #[test]
+    fn empty_element_list() {
+        // Active segment with zero function indices.
+        let wasm = module_with_element_segments(&[active_elem_funcs(0, &[])]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.element_segment_details[0];
+        assert_eq!(seg.element_count, 0);
+        assert!(seg.items.is_empty());
+    }
+
+    #[test]
+    fn function_index_resolution_with_imports() {
+        // 2 imported functions (indices 0, 1) + 1 defined (index 2).
+        // Segment lists [0, 1, 2, 99].
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&import_section(&["imp1", "imp2"]));
+        b.extend_from_slice(&function_section(1));
+        b.extend_from_slice(&code_section(1));
+        b.extend_from_slice(&table_section_bytes());
+        b.extend_from_slice(&element_section_bytes(&[active_elem_funcs(
+            0,
+            &[0, 1, 2, 99],
+        )]));
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.element_segment_details[0];
+        assert_eq!(seg.items.len(), 4);
+
+        // Index 0 → imported "imp1"
+        match &seg.items[0] {
+            ElementItem::FuncIndex(f) => {
+                assert_eq!(f.raw_index, 0);
+                assert_eq!(
+                    f.resolution,
+                    ElementRefResolution::Imported {
+                        module: "env".into(),
+                        name: "imp1".into()
+                    }
+                );
+            }
+            other => panic!("expected FuncIndex, got {other:?}"),
+        }
+        // Index 1 → imported "imp2"
+        match &seg.items[1] {
+            ElementItem::FuncIndex(f) => {
+                assert_eq!(f.raw_index, 1);
+                assert_eq!(
+                    f.resolution,
+                    ElementRefResolution::Imported {
+                        module: "env".into(),
+                        name: "imp2".into()
+                    }
+                );
+            }
+            other => panic!("expected FuncIndex, got {other:?}"),
+        }
+        // Index 2 → defined function
+        match &seg.items[2] {
+            ElementItem::FuncIndex(f) => {
+                assert_eq!(f.raw_index, 2);
+                match &f.resolution {
+                    ElementRefResolution::Defined {
+                        declared_index,
+                        signature,
+                    } => {
+                        assert_eq!(*declared_index, 0);
+                        assert!(signature.contains("->"));
+                    }
+                    other => panic!("expected Defined, got {other:?}"),
+                }
+            }
+            other => panic!("expected FuncIndex, got {other:?}"),
+        }
+        // Index 99 → unresolved/invalid
+        match &seg.items[3] {
+            ElementItem::FuncIndex(f) => {
+                assert_eq!(f.raw_index, 99);
+                assert_eq!(f.resolution, ElementRefResolution::Invalid);
+            }
+            other => panic!("expected FuncIndex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expression_elements_ref_func() {
+        // Active expression segment (flags 0x06, explicit table 0) with
+        // one `ref.func 0` expression. One defined function so the index
+        // resolves to a defined function rather than Invalid.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&function_section(1));
+        b.extend_from_slice(&code_section(1));
+        b.extend_from_slice(&table_section_bytes());
+        let mut v = vec![0x06, 0x00]; // flags 0x06, table 0
+        v.push(0x41);
+        v.extend_from_slice(&leb(0));
+        v.push(0x0b);
+        v.push(0x70); // elemtype funcref
+        v.extend_from_slice(&leb(1)); // count 1
+        v.extend_from_slice(&expr_ref_func(0));
+        b.extend_from_slice(&element_section_bytes(&[v]));
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.element_segment_details[0];
+        match &seg.kind {
+            ElementKind::Expressions { element_type } => {
+                assert_eq!(element_type, "funcref");
+            }
+            other => panic!("expected Expressions, got {other:?}"),
+        }
+        assert_eq!(seg.element_count, 1);
+        assert_eq!(seg.items.len(), 1);
+        match &seg.items[0] {
+            ElementItem::Expr(e) => {
+                assert_eq!(e.element_type, "funcref");
+                match &e.expr {
+                    ElementExpr::RefFunc {
+                        raw_index,
+                        resolution,
+                    } => {
+                        assert_eq!(*raw_index, 0);
+                        match resolution {
+                            ElementRefResolution::Defined { declared_index, .. } => {
+                                assert_eq!(*declared_index, 0)
+                            }
+                            other => panic!(
+                                "expected Defined for func index 0 (no imports), got {other:?}"
+                            ),
+                        }
+                    }
+                    other => panic!("expected RefFunc, got {other:?}"),
+                }
+            }
+            other => panic!("expected Expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expression_elements_ref_null() {
+        // Passive expression segment (flags 0x05) with one `ref.null funcref`.
+        let v = passive_elem_exprs(0x70, &[expr_ref_null(0x70)]);
+        let wasm = module_with_element_segments(&[v]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.element_segment_details[0];
+        assert_eq!(seg.mode, ElementSegmentMode::Passive);
+        match &seg.kind {
+            ElementKind::Expressions { element_type } => {
+                assert_eq!(element_type, "funcref");
+            }
+            other => panic!("expected Expressions, got {other:?}"),
+        }
+        match &seg.items[0] {
+            ElementItem::Expr(e) => match &e.expr {
+                ElementExpr::RefNull { heap_type } => {
+                    assert_eq!(heap_type, "Func");
+                }
+                other => panic!("expected RefNull, got {other:?}"),
+            },
+            other => panic!("expected Expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn element_multiple_segments_preserve_declaration_order() {
+        // Active (functions), passive (functions), declared (functions).
+        let v_decl = declared_elem_funcs(&[0]);
+        let wasm = module_with_element_segments(&[
+            active_elem_funcs(10, &[0, 1]),
+            passive_elem_funcs(&[2]),
+            v_decl,
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.element_segments, 3);
+        assert_eq!(s.element_segment_details.len(), 3);
+        assert_eq!(s.element_segment_details[0].index, 0);
+        assert_eq!(s.element_segment_details[1].index, 1);
+        assert_eq!(s.element_segment_details[2].index, 2);
+        assert_eq!(
+            s.element_segment_details[0].mode,
+            ElementSegmentMode::Active
+        );
+        assert_eq!(
+            s.element_segment_details[1].mode,
+            ElementSegmentMode::Passive
+        );
+        assert_eq!(
+            s.element_segment_details[2].mode,
+            ElementSegmentMode::Declared
+        );
+        assert_eq!(s.element_segment_details[0].kind, ElementKind::Functions);
+        assert_eq!(s.element_segment_details[2].kind, ElementKind::Functions);
+    }
+
+    #[test]
+    fn element_count_excludes_payload_bytes() {
+        // Active segment with 3 function indices: element_count is 3, not the
+        // byte length of the indices.
+        let wasm = module_with_element_segments(&[active_elem_funcs(0, &[0, 1, 2])]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        let seg = &s.element_segment_details[0];
+        assert_eq!(seg.element_count, 3);
+    }
+
+    #[test]
+    fn element_details_omitted_when_no_section() {
+        // A module with memory but no element section.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[0x05, 0x03, 0x01, 0x00, 0x01]);
+        let report = inspect(&b, false).unwrap();
+        let s = report.structure.as_ref().expect("structure present");
+        assert_eq!(s.element_segments, 0);
+        assert!(s.element_segment_details.is_empty());
+        // JSON must omit the empty details array, not emit [].
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            value["structure"].get("element_segment_details").is_none(),
+            "empty details must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn element_segment_json_is_deterministic() {
+        let build = || {
+            module_with_element_segments(&[
+                active_elem_funcs(10, &[0, 1]),
+                passive_elem_funcs(&[2]),
+            ])
+        };
+        let first = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        let second = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        assert_eq!(first, second, "element-segment JSON must be deterministic");
+
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let details = value["structure"]["element_segment_details"]
+            .as_array()
+            .expect("details array");
+        assert_eq!(details.len(), 2);
+        let idx: Vec<u64> = details
+            .iter()
+            .map(|d| d["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(idx, vec![0, 1]);
+    }
+
+    #[test]
+    fn element_count_present_in_structure() {
+        // The aggregate count must remain present alongside the new details.
+        let wasm =
+            module_with_element_segments(&[active_elem_funcs(0, &[0]), passive_elem_funcs(&[1])]);
+        let report = inspect(&wasm, false).unwrap();
+        let s = report.structure.expect("structure present");
+        assert_eq!(s.element_segments, 2);
+        assert_eq!(s.element_segment_details.len(), 2);
+    }
+
+    #[test]
+    fn malformed_element_section_is_rejected() {
+        // Element section with an invalid flags byte (0x08) for the first
+        // segment.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&table_section_bytes());
+        let content = vec![0x01, 0x08];
+        b.push(0x09);
+        b.extend_from_slice(&leb(content.len() as u32));
+        b.extend_from_slice(&content);
+        let result = inspect(&b, false);
+        assert!(
+            result.is_err(),
+            "invalid element segment flags must be rejected as malformed"
+        );
+    }
+
+    // --- Custom section tests ---
+
+    /// Build a minimal WASM module with the given custom sections appended.
+    fn module_with_custom_sections(sections: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        for (name, data) in sections {
+            let payload_len = 1 + name.len() + data.len();
+            b.push(0x00); // custom section id
+            b.push(payload_len as u8);
+            b.push(name.len() as u8);
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(data);
+        }
+        b
+    }
+
+    #[test]
+    fn no_custom_sections_reports_empty_details() {
+        let b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let report = inspect(&b, false).unwrap();
+        assert!(report.custom_sections.is_empty());
+        assert!(report.custom_section_details.is_empty());
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            value.get("custom_section_details").is_none(),
+            "empty details must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn one_named_custom_section() {
+        let wasm = module_with_custom_sections(&[("name", &[0x01, 0x02])]);
+        let report = inspect(&wasm, false).unwrap();
+        assert_eq!(report.custom_sections.len(), 1);
+        assert_eq!(report.custom_section_details.len(), 1);
+        let d = &report.custom_section_details[0];
+        assert_eq!(d.index, 0);
+        assert_eq!(d.name, "name");
+        assert_eq!(d.len_bytes, 2);
+        assert_eq!(d.kind, CustomSectionKind::Name);
+    }
+
+    #[test]
+    fn custom_section_empty_and_non_empty_payloads() {
+        let wasm = module_with_custom_sections(&[("producers", &[]), ("name", &[0xff])]);
+        let report = inspect(&wasm, false).unwrap();
+        assert_eq!(report.custom_section_details.len(), 2);
+        assert_eq!(report.custom_section_details[0].len_bytes, 0);
+        assert_eq!(
+            report.custom_section_details[0].kind,
+            CustomSectionKind::Producers
+        );
+        assert_eq!(report.custom_section_details[1].len_bytes, 1);
+        assert_eq!(
+            report.custom_section_details[1].kind,
+            CustomSectionKind::Name
+        );
+    }
+
+    #[test]
+    fn repeated_names_preserve_all_entries() {
+        let wasm = module_with_custom_sections(&[("dSYM", &[0x01]), ("dSYM", &[0x02, 0x03])]);
+        let report = inspect(&wasm, false).unwrap();
+        assert_eq!(report.custom_sections.len(), 2);
+        assert_eq!(report.custom_section_details.len(), 2);
+        assert_eq!(report.custom_section_details[0].index, 0);
+        assert_eq!(report.custom_section_details[1].index, 1);
+        assert_eq!(report.custom_section_details[0].len_bytes, 1);
+        assert_eq!(report.custom_section_details[1].len_bytes, 2);
+        // Unknown names stay classified as unknown.
+        assert_eq!(
+            report.custom_section_details[0].kind,
+            CustomSectionKind::Unknown
+        );
+        assert_eq!(
+            report.custom_section_details[1].kind,
+            CustomSectionKind::Unknown
+        );
+    }
+
+    #[test]
+    fn multiple_sections_preserve_declaration_order() {
+        let wasm = module_with_custom_sections(&[
+            ("name", &[0x00]),
+            ("producers", &[0xa0]),
+            ("mystery", &[0xb0, 0xb1]),
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let details = &report.custom_section_details;
+        assert_eq!(details.len(), 3);
+        assert_eq!(details[0].index, 0);
+        assert_eq!(details[0].name, "name");
+        assert_eq!(details[1].index, 1);
+        assert_eq!(details[1].name, "producers");
+        assert_eq!(details[2].index, 2);
+        assert_eq!(details[2].name, "mystery");
+        assert_eq!(details[0].kind, CustomSectionKind::Name);
+        assert_eq!(details[1].kind, CustomSectionKind::Producers);
+        assert_eq!(details[2].kind, CustomSectionKind::Unknown);
+    }
+
+    #[test]
+    fn custom_section_payload_is_not_serialized() {
+        let wasm = module_with_custom_sections(&[("name", &[0xab, 0xcd, 0xef])]);
+        let json = serde_json::to_string(&inspect(&wasm, false).unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let detail = &value["custom_section_details"][0];
+        assert_eq!(detail["len_bytes"], 3);
+        // No raw payload field should exist.
+        assert!(detail.get("payload").is_none());
+        assert!(detail.get("data").is_none());
+    }
+
+    #[test]
+    fn custom_section_details_omitted_from_json_when_empty() {
+        let b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let json = serde_json::to_string(&inspect(&b, false).unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("custom_section_details").is_none());
+    }
+
+    #[test]
+    fn custom_section_json_is_deterministic() {
+        let build = || {
+            module_with_custom_sections(&[
+                ("name", &[0x01]),
+                ("producers", &[]),
+                ("dSYM", &[0x02, 0x03]),
+            ])
+        };
+        let first = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        let second = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        assert_eq!(first, second, "custom-section JSON must be deterministic");
+    }
+
+    #[test]
+    fn malformed_custom_section_is_rejected() {
+        // Custom section: id=0, length claims 5 bytes, but only 2 bytes remain.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.push(0x00); // custom section id
+        b.push(0x05); // claims 5 bytes of payload
+        b.push(0x03); // name length 3
+        b.extend_from_slice(b"ab"); // only 2 bytes — truncated
+        let result = inspect(&b, false);
+        assert!(
+            result.is_err(),
+            "truncated custom section must be rejected as malformed"
+        );
+    }
+
+    // --- Code body metrics tests ---
+
+    /// Build a module with one defined function whose body is `body` (locals
+    /// + operators, excluding the body-size prefix).
+    fn module_with_one_body(body: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&function_section(1));
+        let mut payload = vec![0x01]; // one function body
+        payload.push(body.len() as u8); // body size prefix
+        payload.extend_from_slice(body);
+        let mut code = vec![0x0a, payload.len() as u8];
+        code.extend_from_slice(&payload);
+        b.extend_from_slice(&code);
+        b
+    }
+
+    #[test]
+    fn no_defined_functions_has_no_metrics() {
+        // Module with an import but no defined functions.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&import_section(&["imp1"]));
+        let report = inspect(&b, false).unwrap();
+        assert!(report.code_body_metrics.is_empty());
+        let json = serde_json::to_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            value.get("code_body_metrics").is_none(),
+            "empty metrics must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn empty_body_metrics() {
+        // Body: 0 local declarations, just `end`.
+        let report = inspect(&module_with_one_body(&[0x00, 0x0b]), false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.defined_index, 0);
+        assert_eq!(m.function_index, 0);
+        assert_eq!(m.body_len_bytes, 2);
+        assert_eq!(m.local_decl_count, 0);
+        assert_eq!(m.local_total, 0);
+        assert_eq!(m.operator_count, 0);
+        assert_eq!(m.max_control_depth, 0);
+    }
+
+    #[test]
+    fn locals_are_counted() {
+        // Body: 1 local declaration (3 × i32), then `end`.
+        let report = inspect(&module_with_one_body(&[0x01, 0x03, 0x7f, 0x0b]), false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.local_decl_count, 1);
+        assert_eq!(m.local_total, 3);
+        assert_eq!(m.operator_count, 0);
+    }
+
+    #[test]
+    fn nested_block_loop_if_depth() {
+        // Body: 0 locals, block → loop → if → end → end → end → end
+        let body = [
+            0x00, // 0 local declarations
+            0x02, 0x40, // block (void)
+            0x03, 0x40, // loop (void)
+            0x04, 0x40, // if (void)
+            0x0b, // end (if)
+            0x0b, // end (loop)
+            0x0b, // end (block)
+            0x0b, // end (function)
+        ];
+        let report = inspect(&module_with_one_body(&body), false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.max_control_depth, 3);
+        // 3 openers + 3 inner ends = 6 (function-body end excluded).
+        assert_eq!(m.operator_count, 6);
+    }
+
+    #[test]
+    fn imported_functions_precede_defined_in_index() {
+        // 2 imported functions + 1 defined function.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&import_section(&["imp1", "imp2"]));
+        b.extend_from_slice(&function_section(1));
+        b.extend_from_slice(&code_section(1));
+        let report = inspect(&b, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        assert_eq!(m.defined_index, 0);
+        assert_eq!(m.function_index, 2, "imports occupy indices 0 and 1");
+    }
+
+    #[test]
+    fn multiple_bodies_preserve_order() {
+        // 3 defined functions with distinct body sizes.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&function_section(3));
+        let mut payload = vec![0x03]; // three bodies
+                                      // Body 1: empty (end only)
+        payload.extend_from_slice(&[0x02, 0x00, 0x0b]);
+        // Body 2: one nop then end
+        payload.extend_from_slice(&[0x03, 0x00, 0x01, 0x0b]);
+        // Body 3: one local + end
+        payload.extend_from_slice(&[0x04, 0x01, 0x01, 0x7f, 0x0b]);
+        let mut code = vec![0x0a, payload.len() as u8];
+        code.extend_from_slice(&payload);
+        b.extend_from_slice(&code);
+        let report = inspect(&b, false).unwrap();
+        let metrics = &report.code_body_metrics;
+        assert_eq!(metrics.len(), 3);
+        assert_eq!(metrics[0].defined_index, 0);
+        assert_eq!(metrics[1].defined_index, 1);
+        assert_eq!(metrics[2].defined_index, 2);
+        assert_eq!(metrics[0].body_len_bytes, 2);
+        assert_eq!(metrics[1].body_len_bytes, 3);
+        assert_eq!(metrics[2].body_len_bytes, 4);
+        assert_eq!(metrics[1].operator_count, 1, "one nop");
+        assert_eq!(metrics[2].local_total, 1);
+    }
+
+    #[test]
+    fn malformed_code_body_is_rejected() {
+        // Function section declares 1 function, but the code section body
+        // claims a size that exceeds the remaining bytes.
+        let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&type_section(1));
+        b.extend_from_slice(&function_section(1));
+        // Code section: count 1, body size 10, but only 2 bytes follow.
+        let payload = vec![0x01, 0x0a, 0x00, 0x0b];
+        let mut code = vec![0x0a, payload.len() as u8];
+        code.extend_from_slice(&payload);
+        b.extend_from_slice(&code);
+        let result = inspect(&b, false);
+        assert!(
+            result.is_err(),
+            "truncated code body must be rejected as malformed"
+        );
+    }
+
+    #[test]
+    fn code_body_metrics_json_is_deterministic() {
+        let build = || {
+            let mut b = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+            b.extend_from_slice(&type_section(1));
+            b.extend_from_slice(&function_section(2));
+            b.extend_from_slice(&code_section(2));
+            b
+        };
+        let first = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        let second = serde_json::to_string(&inspect(&build(), false).unwrap()).unwrap();
+        assert_eq!(
+            first, second,
+            "code-body metrics JSON must be deterministic"
+        );
+    }
+
+    // --- Instruction inventory tests ---
+
+    /// Build a module with one defined function whose operator stream is
+    /// `ops` (after 0 local declarations).
+    fn module_with_ops(ops: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00]; // 0 local declarations
+        body.extend_from_slice(ops);
+        body.push(0x0b); // end
+        module_with_one_body(&body)
+    }
+
+    fn inv(report: &super::WasmReport) -> &std::collections::BTreeMap<String, usize> {
+        &report.code_body_metrics[0].instruction_inventory
+    }
+
+    #[test]
+    fn inventory_control_flow_families() {
+        // br_if 0 (0x0d 0x00), return (0x0f), call 0 (0x10 0x00),
+        // call_indirect (0x11 0x00 0x00)
+        let wasm = module_with_ops(&[
+            0x0d, 0x00, // br_if 0
+            0x0f, // return
+            0x10, 0x00, // call 0
+            0x11, 0x00, 0x00, // call_indirect type 0 table 0
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let inv = inv(&report);
+        assert_eq!(inv.get("control"), Some(&2), "br_if + return");
+        assert_eq!(inv.get("call"), Some(&2), "call + call_indirect");
+    }
+
+    #[test]
+    fn inventory_local_and_global_families() {
+        // local.get 0 (0x20 0x00), local.set 0 (0x21 0x00),
+        // local.tee 0 (0x22 0x00), global.get 0 (0x23 0x00),
+        // global.set 0 (0x24 0x00)
+        let wasm = module_with_ops(&[
+            0x20, 0x00, // local.get
+            0x21, 0x00, // local.set
+            0x22, 0x00, // local.tee
+            0x23, 0x00, // global.get
+            0x24, 0x00, // global.set
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let inv = inv(&report);
+        assert_eq!(inv.get("local"), Some(&3));
+        assert_eq!(inv.get("global"), Some(&2));
+    }
+
+    #[test]
+    fn inventory_memory_families() {
+        // i32.load (0x28 0x00 0x00), i32.store (0x36 0x00 0x00),
+        // memory.size (0x3f 0x00), memory.grow (0x40 0x00)
+        let wasm = module_with_ops(&[
+            0x28, 0x00, 0x00, // i32.load
+            0x36, 0x00, 0x00, // i32.store
+            0x3f, 0x00, // memory.size
+            0x40, 0x00, // memory.grow
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let inv = inv(&report);
+        assert_eq!(inv.get("load"), Some(&1));
+        assert_eq!(inv.get("store"), Some(&1));
+        assert_eq!(inv.get("memory"), Some(&2));
+    }
+
+    #[test]
+    fn inventory_numeric_and_conversion_families() {
+        // i32.const 1 (0x41 0x01), i32.add (0x6a), i32.eqz (0x45),
+        // i32.wrap_i64 (0xa7)
+        let wasm = module_with_ops(&[
+            0x41, 0x01, // i32.const 1
+            0x6a, // i32.add
+            0x45, // i32.eqz
+            0xa7, // i32.wrap_i64
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let inv = inv(&report);
+        assert_eq!(inv.get("const"), Some(&1));
+        assert_eq!(inv.get("numeric"), Some(&1), "i32.add");
+        assert_eq!(inv.get("compare"), Some(&1), "i32.eqz");
+        assert_eq!(inv.get("conversion"), Some(&1), "i32.wrap_i64");
+    }
+
+    #[test]
+    fn inventory_reference_family() {
+        // ref.null func (0xd0 0x70), ref.is_null (0xd1)
+        let wasm = module_with_ops(&[
+            0xd0, 0x70, // ref.null func
+            0xd1, // ref.is_null
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let inv = inv(&report);
+        assert_eq!(inv.get("reference"), Some(&2));
+    }
+
+    #[test]
+    fn inventory_misc_family() {
+        // nop (0x01), drop (0x1a), unreachable (0x00)
+        let wasm = module_with_ops(&[0x01, 0x1a, 0x00]);
+        let report = inspect(&wasm, false).unwrap();
+        let inv = inv(&report);
+        assert_eq!(inv.get("misc"), Some(&3));
+    }
+
+    #[test]
+    fn inventory_counts_are_exclusive() {
+        // Every operator counted exactly once: sum of inventory values
+        // equals operator_count.
+        let wasm = module_with_ops(&[
+            0x0d, 0x00, // br_if -> control
+            0x20, 0x00, // local.get -> local
+            0x28, 0x00, 0x00, // i32.load -> load
+            0x41, 0x01, // i32.const -> const
+            0x6a, // i32.add -> numeric
+            0x01, // nop -> misc
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let m = &report.code_body_metrics[0];
+        let total: usize = m.instruction_inventory.values().sum();
+        assert_eq!(
+            total, m.operator_count,
+            "inventory must sum to operator_count"
+        );
+    }
+
+    #[test]
+    fn inventory_omitted_when_empty() {
+        // Empty body: no operators, so inventory is empty and omitted.
+        let wasm = module_with_one_body(&[0x00, 0x0b]);
+        let json = serde_json::to_string(&inspect(&wasm, false).unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            value["code_body_metrics"][0]
+                .get("instruction_inventory")
+                .is_none(),
+            "empty inventory must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn inventory_json_is_deterministic_and_sorted() {
+        let wasm = module_with_ops(&[
+            0x0d, 0x00, // control
+            0x20, 0x00, // local
+            0x41, 0x01, // const
+            0x6a, // numeric
+        ]);
+        let first = serde_json::to_string(&inspect(&wasm, false).unwrap()).unwrap();
+        let second = serde_json::to_string(&inspect(&wasm, false).unwrap()).unwrap();
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let inv = &value["code_body_metrics"][0]["instruction_inventory"];
+        // BTreeMap serializes keys in sorted order.
+        let keys: Vec<&str> = inv
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "inventory keys must be sorted");
+    }
+
+    #[test]
+    fn inventory_unknown_falls_back_to_other() {
+        // `if` (0x04 0x40), `else` (0x05), and `end` (0x0b) are all
+        // classified as control; the function-body `end` is excluded from
+        // the inventory, so the count is 3 (if + else + end).
+        let wasm = module_with_ops(&[
+            0x04, 0x40, // if
+            0x05, // else
+            0x0b, // end (if)
+        ]);
+        let report = inspect(&wasm, false).unwrap();
+        let inv = inv(&report);
+        assert_eq!(inv.get("control"), Some(&3), "if + else + end");
     }
 }
