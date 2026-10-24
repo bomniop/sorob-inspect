@@ -2866,3 +2866,100 @@ fn test_inspect_text_output_lists_findings() {
         "text output must include the finding code"
     );
 }
+
+// --- inspect: export_inventory ---
+
+#[test]
+fn test_inspect_export_inventory_counts_and_functions() {
+    let (rc, stdout, _) = run_cli(&["inspect", "tests/fixtures/test_soroban.wasm", "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let inv = &v["analysis"]["export_inventory"];
+    assert!(
+        inv.is_object(),
+        "export_inventory present when exports exist"
+    );
+    assert_eq!(inv["total"], 3, "total export count");
+    let kinds: Vec<&str> = inv["counts_by_kind"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["function", "global", "memory"]);
+    let funcs: Vec<&str> = inv["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(funcs, vec!["hello"]);
+    assert_eq!(
+        inv["functions"][0]["signature"], "(i64) -> (i64)",
+        "resolved signature preserved"
+    );
+}
+
+#[test]
+fn test_inspect_export_inventory_absent_when_no_exports() {
+    let empty = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(
+        empty.path(),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    )
+    .unwrap();
+    let empty_path = empty.path().to_string_lossy().to_string();
+    let (rc, stdout, _) = run_cli(&["inspect", &empty_path, "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(
+        v["analysis"].get("export_inventory").is_none(),
+        "no exports -> export_inventory absent (distinct from empty)"
+    );
+}
+
+#[test]
+fn test_inspect_export_inventory_preserves_existing_fields() {
+    let (rc, stdout, _) = run_cli(&["inspect", "tests/fixtures/test_soroban.wasm", "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let a = &v["analysis"];
+    assert!(a.get("findings").is_some(), "findings preserved");
+    assert!(a.get("coverage").is_some(), "coverage preserved");
+    assert!(
+        a.get("export_inventory").is_some(),
+        "export_inventory added"
+    );
+    assert!(v.get("exports").is_some(), "top-level exports preserved");
+    assert_eq!(v["summary"]["analysis_finding_count"], 0);
+}
+
+#[test]
+fn test_inspect_export_inventory_deterministic_ordering() {
+    let (rc, stdout, _) = run_cli(&["inspect", "tests/fixtures/test_soroban.wasm", "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let kinds: Vec<&str> = v["analysis"]["export_inventory"]["counts_by_kind"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        kinds.windows(2).all(|w| w[0] <= w[1]),
+        "counts sorted by kind"
+    );
+    let funcs: Vec<&str> = v["analysis"]["export_inventory"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        funcs.windows(2).all(|w| w[0] <= w[1]),
+        "functions sorted by name"
+    );
+}

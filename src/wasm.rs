@@ -80,7 +80,7 @@ pub struct InterfaceSummary {
 }
 
 /// A count of entries sharing one resource kind.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KindCount {
     pub kind: String,
     pub count: usize,
@@ -1851,6 +1851,73 @@ pub struct Analysis {
     pub findings: Vec<Finding>,
     /// Which areas were checked vs not checked.
     pub coverage: Coverage,
+    /// Deterministic snapshot of the module's exported public surface, derived
+    /// from the export section (not from `contractspecv0`). Present only when
+    /// the module has at least one export; absent when the module has no
+    /// exports at all (a distinct state from an empty inventory).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub export_inventory: Option<ExportInventory>,
+}
+
+/// One exported function in the module's public surface.
+///
+/// `signature` is the resolved signature string (`(params) -> (results)`) or
+/// `null` when it could not be resolved from the module's type section. The
+/// signature is the semantic identity — never the raw type index, which is only
+/// a position in the declaring module's own type section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExportedFunctionEntry {
+    /// Export name.
+    pub name: String,
+    /// Resolved signature, or `null` when unresolvable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Deterministic snapshot of a module's exported public surface.
+///
+/// Derived from the module's own export section — NOT from `contractspecv0`.
+/// This is an inventory of observed WASM exports, not a claim that every export
+/// is part of the Soroban contract ABI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExportInventory {
+    /// Counts by external kind, sorted by kind name.
+    pub counts_by_kind: Vec<KindCount>,
+    /// Exported functions, sorted by export name.
+    pub functions: Vec<ExportedFunctionEntry>,
+    /// Total export count.
+    pub total: usize,
+}
+
+/// Build an [`ExportInventory`] from a module's resolved exports.
+///
+/// Reuses the resolved `ExportEntry` data already produced by `inspect` — no
+/// second WASM parse and no independent signature resolver.
+pub fn build_export_inventory(exports: &[ExportEntry]) -> ExportInventory {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for e in exports {
+        *counts.entry(e.kind.as_str()).or_insert(0) += 1;
+    }
+    let mut functions: Vec<ExportedFunctionEntry> = exports
+        .iter()
+        .filter(|e| e.kind == "function")
+        .map(|e| ExportedFunctionEntry {
+            name: e.name.clone(),
+            signature: e.type_sig.clone(),
+        })
+        .collect();
+    functions.sort_by(|a, b| a.name.cmp(&b.name));
+    ExportInventory {
+        counts_by_kind: counts
+            .into_iter()
+            .map(|(kind, count)| KindCount {
+                kind: kind.to_string(),
+                count,
+            })
+            .collect(),
+        functions,
+        total: exports.len(),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3107,6 +3174,7 @@ pub fn analyze(bytes: &[u8]) -> Result<Analysis, InspectError> {
         element_segment_count,
         findings,
         coverage,
+        export_inventory: None,
     })
 }
 
@@ -5689,5 +5757,126 @@ mod tests {
             }
             other => panic!("expected Defined, got {other:?}"),
         }
+    }
+
+    // --- export inventory ---
+
+    fn fn_export(name: &str, sig: Option<&str>) -> ExportEntry {
+        ExportEntry {
+            name: name.to_string(),
+            kind: "function".to_string(),
+            index: 0,
+            type_sig: sig.map(|s| s.to_string()),
+            type_index: None,
+            memory: None,
+            table: None,
+            global: None,
+        }
+    }
+
+    fn mem_export(name: &str) -> ExportEntry {
+        ExportEntry {
+            name: name.to_string(),
+            kind: "memory".to_string(),
+            index: 0,
+            type_sig: None,
+            type_index: None,
+            memory: Some(MemoryBounds {
+                min_pages: 1,
+                max_pages: None,
+                is64: false,
+                shared: false,
+            }),
+            table: None,
+            global: None,
+        }
+    }
+
+    fn glob_export(name: &str) -> ExportEntry {
+        ExportEntry {
+            name: name.to_string(),
+            kind: "global".to_string(),
+            index: 0,
+            type_sig: None,
+            type_index: None,
+            memory: None,
+            table: None,
+            global: Some(GlobalEntry {
+                mutable: false,
+                value_type: "i32".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn export_inventory_counts_by_kind() {
+        let exports = vec![
+            fn_export("f1", Some("() -> ()")),
+            fn_export("f2", Some("() -> ()")),
+            mem_export("memory"),
+            glob_export("g"),
+        ];
+        let inv = build_export_inventory(&exports);
+        assert_eq!(inv.total, 4);
+        let kinds: Vec<(&str, usize)> = inv
+            .counts_by_kind
+            .iter()
+            .map(|k| (k.kind.as_str(), k.count))
+            .collect();
+        assert_eq!(kinds, vec![("function", 2), ("global", 1), ("memory", 1)]);
+    }
+
+    #[test]
+    fn export_inventory_functions_sorted_with_signatures() {
+        let exports = vec![
+            fn_export("zeta", Some("(i32) -> ()")),
+            fn_export("alpha", Some("() -> ()")),
+        ];
+        let inv = build_export_inventory(&exports);
+        assert_eq!(inv.functions.len(), 2);
+        assert_eq!(inv.functions[0].name, "alpha");
+        assert_eq!(inv.functions[0].signature.as_deref(), Some("() -> ()"));
+        assert_eq!(inv.functions[1].name, "zeta");
+        assert_eq!(inv.functions[1].signature.as_deref(), Some("(i32) -> ()"));
+    }
+
+    #[test]
+    fn export_inventory_unresolved_signature_is_none() {
+        let exports = vec![fn_export("hello", None)];
+        let inv = build_export_inventory(&exports);
+        assert_eq!(inv.functions.len(), 1);
+        assert!(
+            inv.functions[0].signature.is_none(),
+            "unresolved signature must be null"
+        );
+    }
+
+    #[test]
+    fn export_inventory_empty_exports_is_empty_inventory() {
+        let inv = build_export_inventory(&[]);
+        assert_eq!(inv.total, 0);
+        assert!(inv.counts_by_kind.is_empty());
+        assert!(inv.functions.is_empty());
+    }
+
+    #[test]
+    fn export_inventory_ignores_type_indices() {
+        // Two functions with the same resolved signature but different type
+        // indices must produce identical inventory entries.
+        let a = vec![fn_export("f", Some("(i32) -> ()"))];
+        let b = vec![fn_export("f", Some("(i32) -> ()"))];
+        assert_eq!(build_export_inventory(&a), build_export_inventory(&b));
+    }
+
+    #[test]
+    fn export_inventory_deterministic_across_runs() {
+        let exports = vec![
+            fn_export("b", Some("() -> ()")),
+            fn_export("a", Some("() -> ()")),
+            mem_export("memory"),
+        ];
+        let first = build_export_inventory(&exports);
+        let second = build_export_inventory(&exports);
+        assert_eq!(first, second);
     }
 }

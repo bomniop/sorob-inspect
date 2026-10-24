@@ -343,6 +343,46 @@ calls, and multi-memory. These produce no finding rather than a guess.
 accepts. `incompatible` means a documented or tested rejection. Neither is
 inferred from metadata alone — both come from running a validator.
 
+### Export inventory
+
+`inspect` also emits `export_inventory` in the JSON `analysis` object: a
+deterministic snapshot of the module's exported public surface, derived from
+the module's own export section — **not** from `contractspecv0`. It is present
+only when the module has at least one export; a module with no exports omits
+the field entirely, which is a distinct state from an empty inventory.
+
+```json
+"export_inventory": {
+  "counts_by_kind": [
+    { "kind": "function", "count": 1 },
+    { "kind": "global", "count": 1 },
+    { "kind": "memory", "count": 1 }
+  ],
+  "functions": [
+    { "name": "hello", "signature": "(i64) -> (i64)" }
+  ],
+  "total": 3
+}
+```
+
+- `counts_by_kind` — export counts per external kind, sorted by kind name.
+- `functions` — exported functions, sorted by export name. `signature` is the
+  resolved signature string, or `null` when it could not be resolved from the
+  module's type section (the same condition reported as an `export_unresolvable`
+  finding).
+- `total` — total export count across all kinds.
+
+The signature is the semantic identity of a function export. Raw type indices
+are never used: an index is only a position in the declaring module's own type
+section, so independently compiled modules can assign different indices to
+equivalent signatures.
+
+This inventory is an observation of raw WASM exports, **not** a claim that
+every export is part of the Soroban contract ABI. The contract-spec interface
+is reported separately by `validate`. Baseline-relative change detection
+(added/removed/changed exports) is `diff`'s job; see
+[Structural export comparison](#structural-export-comparison).
+
 ### Coverage
 
 The `analysis` object also carries a `coverage` field distinguishing checks

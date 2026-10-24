@@ -223,6 +223,16 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
             }
 
+            // Deterministic export inventory from the module's own export
+            // section. Absent when the module has no exports at all, which is
+            // a distinct state from an empty inventory.
+            if !report.exports.is_empty() {
+                if let Some(a) = report.analysis.as_mut() {
+                    a.export_inventory =
+                        Some(sorob_inspect::wasm::build_export_inventory(&report.exports));
+                }
+            }
+
             // Refresh the consolidated summary so `analysis_finding_count`
             // reflects the analysis that was just attached.
             report.summary =
