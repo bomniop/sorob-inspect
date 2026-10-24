@@ -2963,3 +2963,86 @@ fn test_inspect_export_inventory_deterministic_ordering() {
         "functions sorted by name"
     );
 }
+
+#[test]
+fn test_inspect_export_inventory_text_output_counts_and_signatures() {
+    let (rc, stdout, _) = run_cli(&["inspect", "tests/fixtures/test_soroban.wasm"]);
+    assert_eq!(rc, 0);
+    assert!(
+        stdout.contains("--- export inventory ---"),
+        "text output includes export inventory section"
+    );
+    assert!(
+        stdout.contains("total exports: 3"),
+        "text shows total count"
+    );
+    assert!(stdout.contains("function: 1"), "text shows function count");
+    assert!(
+        stdout.contains("fn hello (i64) -> (i64)"),
+        "text shows resolved signature"
+    );
+}
+
+#[test]
+fn test_inspect_export_inventory_text_output_unresolved_signature() {
+    let mut bytes = std::fs::read("tests/fixtures/test_soroban.wasm").unwrap();
+    let mut i = 8;
+    while i < bytes.len() {
+        let sid = bytes[i];
+        i += 1;
+        let mut size = 0usize;
+        let mut shift = 0;
+        loop {
+            let b = bytes[i];
+            i += 1;
+            size |= ((b & 0x7F) as usize) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let body = i;
+        if sid == 3 {
+            bytes[body + 1] = 2;
+            break;
+        }
+        i += size;
+    }
+    let f = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(f.path(), &bytes).unwrap();
+    let path = f.path().to_string_lossy().to_string();
+
+    let (rc, stdout, _) = run_cli(&["inspect", &path]);
+    assert_eq!(rc, 0);
+    assert!(
+        stdout.contains("--- export inventory ---"),
+        "text output includes export inventory section"
+    );
+    assert!(
+        stdout.contains("fn hello (signature unresolved)"),
+        "text shows unresolved signature explicitly"
+    );
+}
+
+#[test]
+fn test_inspect_export_inventory_text_output_absent_when_no_exports() {
+    let empty = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(
+        empty.path(),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    )
+    .unwrap();
+    let empty_path = empty.path().to_string_lossy().to_string();
+    let (rc, stdout, _) = run_cli(&["inspect", &empty_path]);
+    assert_eq!(rc, 0);
+    assert!(
+        !stdout.contains("--- export inventory ---"),
+        "no export inventory section when there are no exports"
+    );
+}

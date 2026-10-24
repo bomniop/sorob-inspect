@@ -872,6 +872,19 @@ fn print_wasm_report(path: &Path, report: &WasmReport) {
         println!("  functions: {}", a.function_count);
         println!("  data segments: {}", a.data_segment_count);
         println!("  element segments: {}", a.element_segment_count);
+        if let Some(inv) = &a.export_inventory {
+            println!("--- export inventory ---");
+            println!("  total exports: {}", inv.total);
+            for k in &inv.counts_by_kind {
+                println!("  {}: {}", k.kind, k.count);
+            }
+            for f in &inv.functions {
+                match &f.signature {
+                    Some(sig) => println!("  fn {} {sig}", f.name),
+                    None => println!("  fn {} (signature unresolved)", f.name),
+                }
+            }
+        }
         if !a.findings.is_empty() {
             println!("--- compatibility findings ---");
             for f in &a.findings {

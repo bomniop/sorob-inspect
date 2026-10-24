@@ -383,6 +383,25 @@ is reported separately by `validate`. Baseline-relative change detection
 (added/removed/changed exports) is `diff`'s job; see
 [Structural export comparison](#structural-export-comparison).
 
+#### Text output
+
+`inspect` prints the same inventory in human-readable form under
+`--- export inventory ---`:
+
+```
+--- export inventory ---
+  total exports: 3
+  function: 1
+  global: 1
+  memory: 1
+  fn hello (i64) -> (i64)
+```
+
+When a function signature cannot be resolved, the text output shows
+`fn <name> (signature unresolved)` — no fabricated signature or raw type index
+is printed. A module with no exports omits the section entirely, which is
+different from a module whose exports all resolve.
+
 ### Coverage
 
 The `analysis` object also carries a `coverage` field distinguishing checks
