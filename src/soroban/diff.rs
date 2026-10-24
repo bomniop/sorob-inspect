@@ -65,10 +65,19 @@ use std::collections::BTreeMap;
 /// - `old_undecodable` — old present but undecodable, new decoded.
 /// - `new_undecodable` — new present but undecodable, old decoded.
 /// - `undecodable_both` — both present but undecodable.
+///
+/// `transition` summarizes each side's compatibility assessment against an
+/// explicitly supplied target protocol (`accepted`/`rejected`) when the operator
+/// passed `--target-protocol`; it is `not_assessable` otherwise, or whenever
+/// either side has no decodable version. A missing or undecodable section is
+/// therefore never reported as a verdict of `rejected`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EnvMetaDiff {
     /// Outcome class, see the type docs.
     pub status: String,
+    /// Transition between the two sides' assessments, e.g.
+    /// `accepted_to_rejected`, or `not_assessable`.
+    pub transition: String,
     /// Old side. Omitted when that module had no `contractenvmetav0` section.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old: Option<EnvMetaReport>,
@@ -101,11 +110,37 @@ pub fn diff_env_meta(old: Option<&EnvMetaReport>, new: Option<&EnvMetaReport>) -
             (false, false) => "undecodable_both",
         },
     };
+    // `transition` reads the per-side `assessment` (set by the CLI when the
+    // operator supplies `--target-protocol`). Missing/undecodable sides carry
+    // no assessment, which collapses to `not_assessable` — never `rejected`.
+    let transition = assessment_transition(
+        old.and_then(|r| r.assessment.as_ref())
+            .map(|a| a.verdict.as_str()),
+        new.and_then(|r| r.assessment.as_ref())
+            .map(|a| a.verdict.as_str()),
+    );
     EnvMetaDiff {
         status: status.to_string(),
+        transition,
         old: old.cloned(),
         new: new.cloned(),
     }
+}
+
+/// Derive a transition label from two optional verdicts.
+///
+/// `None` (absent/undecodable/not_assessable side) collapses to
+/// `not_assessable`; only when both sides are `accepted`/`rejected` is a
+/// directional transition produced.
+fn assessment_transition(old: Option<&str>, new: Option<&str>) -> String {
+    match (old, new) {
+        (Some("accepted"), Some("accepted")) => "accepted_to_accepted",
+        (Some("accepted"), Some("rejected")) => "accepted_to_rejected",
+        (Some("rejected"), Some("accepted")) => "rejected_to_accepted",
+        (Some("rejected"), Some("rejected")) => "rejected_to_rejected",
+        _ => "not_assessable",
+    }
+    .to_string()
 }
 
 /// Result of comparing two decoded contract specs.

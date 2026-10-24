@@ -153,3 +153,66 @@ fn env_meta_diagnostic_attached_to_decoded_only() {
         "undecodable has no version to evaluate"
     );
 }
+
+/// Build a report carrying a given assessment verdict (or none).
+fn with_verdict(verdict: &str) -> EnvMetaReport {
+    let mut r = decoded(28, 0);
+    r.assessment = Some(sorob_inspect::soroban::EnvMetaAssessment {
+        verdict: verdict.to_string(),
+        reason: "reason".to_string(),
+        inputs: sorob_inspect::soroban::EnvMetaAssessmentInputs {
+            curr_ledger_protocol: 28,
+            host_protocol: 28,
+            host_pre_release: 0,
+        },
+        got_protocol: 28,
+        got_pre_release: 0,
+        want_protocol: 28,
+    });
+    r
+}
+
+#[test]
+fn env_meta_transition_table() {
+    let t = |old: Option<&EnvMetaReport>, new: Option<&EnvMetaReport>| {
+        sorob_inspect::soroban::diff::diff_env_meta(old, new).transition
+    };
+    // Both sides assessed: the four directional transitions.
+    assert_eq!(
+        t(
+            Some(&with_verdict("accepted")),
+            Some(&with_verdict("accepted"))
+        ),
+        "accepted_to_accepted"
+    );
+    assert_eq!(
+        t(
+            Some(&with_verdict("accepted")),
+            Some(&with_verdict("rejected"))
+        ),
+        "accepted_to_rejected"
+    );
+    assert_eq!(
+        t(
+            Some(&with_verdict("rejected")),
+            Some(&with_verdict("accepted"))
+        ),
+        "rejected_to_accepted"
+    );
+    assert_eq!(
+        t(
+            Some(&with_verdict("rejected")),
+            Some(&with_verdict("rejected"))
+        ),
+        "rejected_to_rejected"
+    );
+    // A missing or undecodable side collapses to not_assessable, never a verdict.
+    assert_eq!(t(Some(&with_verdict("rejected")), None), "not_assessable");
+    assert_eq!(t(None, Some(&with_verdict("accepted"))), "not_assessable");
+    assert_eq!(t(None, None), "not_assessable");
+    // An undecodable (not_applicable) side is not a verdict -> not_assessable.
+    assert_eq!(
+        t(Some(&undecodable()), Some(&with_verdict("rejected"))),
+        "not_assessable"
+    );
+}

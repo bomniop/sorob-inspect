@@ -2226,3 +2226,197 @@ fn test_diff_env_meta_changed_text_has_hint() {
         "text reports the actionable hint"
     );
 }
+
+// --- diff: assess BOTH sides against an explicit target protocol ---
+
+/// Write a copy of `test_soroban.wasm` with its env-meta protocol/pre-release
+/// patched, returning the temp file (kept alive) and its path.
+fn patched_env_meta_wasm(proto: u32, pre: u32) -> (tempfile::NamedTempFile, String) {
+    let mut bytes = std::fs::read("tests/fixtures/test_soroban.wasm").unwrap();
+    patch_env_meta(&mut bytes, proto, pre);
+    let f = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(f.path(), &bytes).unwrap();
+    let p = f.path().to_string_lossy().to_string();
+    (f, p)
+}
+
+/// (label, old (proto, pre), new (proto, pre), target protocol, expected transition)
+type TransitionCase = (&'static str, (u32, u32), (u32, u32), u32, &'static str);
+
+#[test]
+fn test_diff_env_meta_assessment_transitions() {
+    let cases: &[TransitionCase] = &[
+        (
+            "accepted_to_accepted",
+            (28, 0),
+            (28, 0),
+            28,
+            "accepted_to_accepted",
+        ),
+        (
+            "accepted_to_rejected",
+            (27, 0),
+            (28, 0),
+            27,
+            "accepted_to_rejected",
+        ),
+        (
+            "rejected_to_accepted",
+            (28, 0),
+            (27, 0),
+            27,
+            "rejected_to_accepted",
+        ),
+        (
+            "rejected_to_rejected",
+            (28, 0),
+            (28, 0),
+            27,
+            "rejected_to_rejected",
+        ),
+    ];
+    for (label, (op, opr), (np, npr), target, want) in cases {
+        let (_oa, opath) = patched_env_meta_wasm(*op, *opr);
+        let (_na, npath) = patched_env_meta_wasm(*np, *npr);
+        let t = target.to_string();
+        let (rc, stdout, _) = run_cli(&["diff", &opath, &npath, "--target-protocol", &t, "--json"]);
+        assert_eq!(rc, 0, "{label}: exit code unchanged by assessment");
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        assert_eq!(v["env_meta"]["transition"], *want, "{label}: transition");
+        // Both sides assessed in the four directional cases.
+        assert!(
+            v["env_meta"]["old"].get("assessment").is_some(),
+            "{label}: old assessed"
+        );
+        assert!(
+            v["env_meta"]["new"].get("assessment").is_some(),
+            "{label}: new assessed"
+        );
+    }
+}
+
+#[test]
+fn test_diff_env_meta_assessment_not_assessable_when_side_absent() {
+    // A module with no contractenvmetav0 cannot be assessed. This must be
+    // reported as not_assessable, never as a `rejected` verdict.
+    let empty = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(
+        empty.path(),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    )
+    .unwrap();
+    let empty_path = empty.path().to_string_lossy().to_string();
+
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        &empty_path,
+        "--target-protocol",
+        "28",
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["env_meta"]["transition"], "not_assessable");
+    assert_eq!(v["env_meta"]["status"], "removed");
+    // The absent side carries no assessment at all (not a rejection).
+    assert!(v["env_meta"].get("new").is_none(), "absent side omitted");
+    assert_eq!(v["env_meta"]["old"]["assessment"]["verdict"], "accepted");
+}
+
+#[test]
+fn test_diff_env_meta_assessment_does_not_affect_fail_on_breaking() {
+    // A rejected env-protocol assessment must NOT be turned into a spec-level
+    // breaking verdict: --fail-on-breaking gates only the spec compatibility.
+    let (_oa, opath) = patched_env_meta_wasm(28, 0);
+    let (_na, npath) = patched_env_meta_wasm(27, 0);
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        &opath,
+        &npath,
+        "--target-protocol",
+        "27",
+        "--fail-on-breaking",
+        "--json",
+    ]);
+    assert_eq!(rc, 0, "env assessment must not trigger --fail-on-breaking");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["env_meta"]["transition"], "rejected_to_accepted");
+}
+
+#[test]
+fn test_diff_env_meta_assessment_bad_args() {
+    for (args, label) in [
+        (vec!["--host-protocol", "28"], "host without target"),
+        (vec!["--target-protocol", "0"], "zero target"),
+        (
+            vec!["--target-protocol", "30", "--host-protocol", "28"],
+            "target exceeds host",
+        ),
+        (
+            vec!["--host-pre-release", "1"],
+            "pre-release without target",
+        ),
+    ] {
+        let mut full = vec![
+            "diff",
+            "tests/fixtures/test_soroban.wasm",
+            "tests/fixtures/udt_contract_c.wasm",
+        ];
+        full.extend_from_slice(&args);
+        let (rc, _, _) = run_cli(&full);
+        assert_eq!(rc, 1, "{label}: must be rejected");
+    }
+}
+
+#[test]
+fn test_diff_env_meta_assessment_omitted_is_backward_compatible() {
+    // Without --target-protocol: no assessment anywhere, transition reports
+    // not_assessable, and the existing fields/exit code are unchanged.
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        "tests/fixtures/udt_contract_c.wasm",
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["env_meta"]["status"], "identical");
+    assert_eq!(v["env_meta"]["transition"], "not_assessable");
+    assert!(v["env_meta"]["old"].get("assessment").is_none());
+    assert!(v["env_meta"]["new"].get("assessment").is_none());
+    // Pre-existing keys are still present.
+    assert!(v.get("schema_version").is_some());
+    assert!(v.get("structural").is_some());
+    assert!(v.get("spec").is_some());
+}
+
+#[test]
+fn test_diff_env_meta_assessment_text_output() {
+    let (_oa, opath) = patched_env_meta_wasm(28, 0);
+    let (_na, npath) = patched_env_meta_wasm(27, 0);
+    let (rc, stdout, _) = run_cli(&["diff", &opath, &npath, "--target-protocol", "27"]);
+    assert_eq!(rc, 0);
+    assert!(
+        stdout.contains("env interface version assessment:"),
+        "text prints the assessment block"
+    );
+    assert!(
+        stdout.contains("transition: rejected -> accepted"),
+        "text prints the transition"
+    );
+    assert!(
+        stdout.contains("old: REJECTED"),
+        "text prints the old verdict"
+    );
+    assert!(
+        stdout.contains("new: ACCEPTED"),
+        "text prints the new verdict"
+    );
+}

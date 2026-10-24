@@ -155,7 +155,7 @@ this tool never performs a network lookup on its own.
 }
 ```
 
-Flags (only on `validate`):
+Flags (on `validate` and `diff`; identical validation in both):
 
 - `--target-protocol <N>`: target network's current ledger protocol. Required
   to enable the assessment. Must be `>= 1`.
@@ -170,6 +170,29 @@ assessment reports `NOT ASSESSED`. The `reason` echoes the host's exact
 rejection message. Exit-code behavior is unchanged: an assessment never fails
 the command; the verdict is informational only (grep `env_meta.assessment.verdict`
 in CI if you need a gate).
+
+#### Assessing both sides of a `diff`
+
+`diff` applies the **same** inputs to both modules and adds a `transition`
+summary alongside the per-side verdicts, so an upgrade can be judged in one
+command:
+
+```json
+"env_meta": {
+  "status": "changed",
+  "transition": "rejected_to_accepted",
+  "old": { "protocol": 28, "assessment": { "verdict": "rejected", "...": "..." } },
+  "new": { "protocol": 27, "assessment": { "verdict": "accepted", "...": "..." } }
+}
+```
+
+`transition` is one of `accepted_to_accepted`, `accepted_to_rejected`,
+`rejected_to_accepted`, `rejected_to_rejected`, or `not_assessable`. It is
+`not_assessable` when no `--target-protocol` was supplied **or** when either side
+has no decodable version — a missing or undecodable section is never reported as
+`rejected`. The assessment is deliberately kept out of the spec-level verdict, so
+`--fail-on-breaking` continues to gate only spec compatibility.
+
 
 Argument validation (all non-zero exit, no report):
 

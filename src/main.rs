@@ -85,6 +85,22 @@ enum Command {
         /// know.
         #[arg(long)]
         fail_on_breaking: bool,
+        /// Target network's current ledger protocol. When supplied, both the old
+        /// and new modules are assessed against the Soroban host's exact
+        /// acceptance rule and the result (each side's verdict plus a
+        /// transition summary) is added to `env_meta`. Assessment is
+        /// informational only; it never changes the `--fail-on-breaking`
+        /// verdict or the exit code. Shares the same validation as `validate`.
+        #[arg(long, value_name = "PROTOCOL")]
+        target_protocol: Option<u32>,
+        /// Host's compiled protocol for the assessment. Defaults to
+        /// `--target-protocol`. Requires `--target-protocol`.
+        #[arg(long, value_name = "PROTOCOL")]
+        host_protocol: Option<u32>,
+        /// Host's compiled pre-release for the assessment. Defaults to 0.
+        /// Requires `--target-protocol`.
+        #[arg(long, value_name = "PRE_RELEASE")]
+        host_pre_release: Option<u32>,
     },
 }
 
@@ -101,6 +117,51 @@ fn main() -> ExitCode {
 
 fn read_wasm(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// Validate and assemble explicit protocol inputs for an env-interface-version
+/// assessment. Shared by `validate` and `diff` so both enforce identical rules.
+///
+/// Returns `Ok(None)` when no `--target-protocol` was supplied (no assessment).
+/// Performs *no* network lookup and infers nothing: the host protocol defaults
+/// to the target protocol, and the host pre-release defaults to 0, both
+/// documented choices rather than network-derived values.
+fn build_assessment_inputs(
+    target_protocol: Option<u32>,
+    host_protocol: Option<u32>,
+    host_pre_release: Option<u32>,
+) -> Result<Option<EnvMetaAssessmentInputs>, String> {
+    match target_protocol {
+        None => {
+            if host_protocol.is_some() || host_pre_release.is_some() {
+                return Err(
+                    "--host-protocol and --host-pre-release require --target-protocol".to_string(),
+                );
+            }
+            Ok(None)
+        }
+        Some(target) => {
+            if target == 0 {
+                return Err("--target-protocol must be >= 1".to_string());
+            }
+            let host = host_protocol.unwrap_or(target);
+            if host == 0 {
+                return Err("--host-protocol must be >= 1".to_string());
+            }
+            if target > host {
+                return Err(format!(
+                    "--target-protocol ({target}) exceeds --host-protocol ({host}): \
+                     the host cannot validate a network running a newer protocol \
+                     than the host supports"
+                ));
+            }
+            Ok(Some(EnvMetaAssessmentInputs {
+                curr_ledger_protocol: target,
+                host_protocol: host,
+                host_pre_release: host_pre_release.unwrap_or(0),
+            }))
+        }
+    }
 }
 
 fn run(cli: Cli) -> Result<(), String> {
@@ -131,38 +192,9 @@ fn run(cli: Cli) -> Result<(), String> {
 
             // Explicit protocol inputs. Nothing is assumed: an assessment is
             // produced only when the operator supplies the target protocol.
-            let assessment_inputs = match target_protocol {
-                None => {
-                    if host_protocol.is_some() || host_pre_release.is_some() {
-                        return Err(
-                            "--host-protocol and --host-pre-release require --target-protocol"
-                                .to_string(),
-                        );
-                    }
-                    None
-                }
-                Some(target) => {
-                    if target == 0 {
-                        return Err("--target-protocol must be >= 1".to_string());
-                    }
-                    let host = host_protocol.unwrap_or(target);
-                    if host == 0 {
-                        return Err("--host-protocol must be >= 1".to_string());
-                    }
-                    if target > host {
-                        return Err(format!(
-                            "--target-protocol ({target}) exceeds --host-protocol ({host}): \
-                             the host cannot validate a network running a newer protocol \
-                             than the host supports"
-                        ));
-                    }
-                    Some(EnvMetaAssessmentInputs {
-                        curr_ledger_protocol: target,
-                        host_protocol: host,
-                        host_pre_release: host_pre_release.unwrap_or(0),
-                    })
-                }
-            };
+            // Shared with `diff` so both commands enforce identical validation.
+            let assessment_inputs =
+                build_assessment_inputs(target_protocol, host_protocol, host_pre_release)?;
 
             if let Some(inputs) = assessment_inputs.as_ref() {
                 if let Some(em) = report.env_meta.as_mut() {
@@ -262,6 +294,9 @@ fn run(cli: Cli) -> Result<(), String> {
             new,
             json,
             fail_on_breaking,
+            target_protocol,
+            host_protocol,
+            host_pre_release,
         } => {
             let old_bytes = read_wasm(&old)?;
             let new_bytes = read_wasm(&new)?;
@@ -280,10 +315,26 @@ fn run(cli: Cli) -> Result<(), String> {
 
             // Environment interface version diff: reuse the decoder from the
             // `validate` path. `None` means the module has no env-meta section.
-            let old_env_meta = sorob_inspect::soroban::decode_env_meta_from_wasm(&old_bytes)
+            let mut old_env_meta = sorob_inspect::soroban::decode_env_meta_from_wasm(&old_bytes)
                 .map_err(|e| e.to_string())?;
-            let new_env_meta = sorob_inspect::soroban::decode_env_meta_from_wasm(&new_bytes)
+            let mut new_env_meta = sorob_inspect::soroban::decode_env_meta_from_wasm(&new_bytes)
                 .map_err(|e| e.to_string())?;
+
+            // Same validation/rules as `validate`: no inference, no network
+            // lookup. When supplied, attach the exact host-rule verdict to each
+            // side *before* diffing so `transition` reflects both assessments.
+            let assessment_inputs =
+                build_assessment_inputs(target_protocol, host_protocol, host_pre_release)?;
+            let assessed = assessment_inputs.is_some();
+            if let Some(inputs) = assessment_inputs.as_ref() {
+                if let Some(em) = old_env_meta.as_mut() {
+                    em.assessment = Some(assess_env_meta(em, inputs));
+                }
+                if let Some(em) = new_env_meta.as_mut() {
+                    em.assessment = Some(assess_env_meta(em, inputs));
+                }
+            }
+
             let env_meta_diff = sorob_inspect::soroban::diff::diff_env_meta(
                 old_env_meta.as_ref(),
                 new_env_meta.as_ref(),
@@ -361,6 +412,18 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!(
                         "  -> evaluate against the target network's ledger protocol \
                          (see env_meta.diagnostic in --json for the host's rule)"
+                    );
+                }
+                // Optional protocol assessment (when --target-protocol was given).
+                // Informational only; never affects the spec-level verdict.
+                if assessed {
+                    println!();
+                    println!("env interface version assessment:");
+                    print_env_meta_side("old", env_meta_diff.old.as_ref());
+                    print_env_meta_side("new", env_meta_diff.new.as_ref());
+                    println!(
+                        "  transition: {}",
+                        format_transition(&env_meta_diff.transition)
                     );
                 }
             }
@@ -861,6 +924,28 @@ fn describe_env_meta_diff(d: &sorob_inspect::soroban::diff::EnvMetaDiff) -> Stri
         "undecodable_both" => "undecodable in both modules".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Render one side of an env-interface-version assessment as a text line.
+fn print_env_meta_side(label: &str, side: Option<&sorob_inspect::soroban::EnvMetaReport>) {
+    match side.and_then(|r| r.assessment.as_ref()) {
+        Some(a) => println!(
+            "  {}: {} — {} (got proto {}/pre {}, want_proto {})",
+            label,
+            a.verdict.to_uppercase(),
+            a.reason,
+            a.got_protocol,
+            a.got_pre_release,
+            a.want_protocol
+        ),
+        None => println!("  {label}: not assessable"),
+    }
+}
+
+/// Render a transition token as a human-readable arrow, e.g.
+/// `accepted_to_rejected` -> `accepted -> rejected`.
+fn format_transition(token: &str) -> String {
+    token.replace("_to_", " -> ")
 }
 
 fn print_diff(old: &Path, new: &Path, d: &DiffReport) {
