@@ -2630,3 +2630,87 @@ fn test_diff_fail_if_rejected_and_fail_on_breaking_independent() {
         "stderr surfaces the env rejection"
     );
 }
+
+// --- structural export diff (independent of contract spec) ---
+
+#[test]
+fn test_structural_export_diff_added_function() {
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        "tests/fixtures/udt_contract_c.wasm",
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let se = &v["structural"]["structural_exports"];
+    assert!(se.is_object(), "structural_exports present");
+    assert_eq!(se["compatibility"], "breaking");
+    let names: Vec<&str> = se["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"hello"), "removed function reported");
+    assert!(names.contains(&"describe"), "added function reported");
+}
+
+#[test]
+fn test_structural_export_diff_identical_exports() {
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        "tests/fixtures/test_soroban.wasm",
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let se = &v["structural"]["structural_exports"];
+    assert_eq!(se["compatibility"], "identical");
+    assert!(se["changes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_structural_export_diff_no_spec_present() {
+    let empty = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(
+        empty.path(),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    )
+    .unwrap();
+    let empty_path = empty.path().to_string_lossy().to_string();
+    let (rc, stdout, _) = run_cli(&["diff", &empty_path, &empty_path, "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let se = &v["structural"]["structural_exports"];
+    assert_eq!(se["compatibility"], "identical");
+    assert!(se["changes"].as_array().unwrap().is_empty());
+    assert!(
+        v["spec"].is_null(),
+        "spec is null when no contractspecv0 decodes"
+    );
+}
+
+#[test]
+fn test_structural_export_diff_does_not_affect_fail_on_breaking() {
+    // Structural export changes must NOT be folded into --fail-on-breaking,
+    // which gates only the spec-level verdict.
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        "tests/fixtures/udt_contract_c.wasm",
+        "--fail-on-breaking",
+        "--json",
+    ]);
+    assert_eq!(rc, 1, "spec-level breaking still gates the exit code");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        v["structural"]["structural_exports"]["compatibility"],
+        "breaking"
+    );
+    assert_eq!(v["spec"]["compatibility"], "breaking");
+}

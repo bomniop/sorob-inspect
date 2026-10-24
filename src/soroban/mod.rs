@@ -9,6 +9,7 @@
 
 pub mod consistency;
 pub mod diff;
+pub mod structural;
 
 use crate::wasm::{inspect, InspectError, WasmReport};
 use serde::{Deserialize, Serialize};

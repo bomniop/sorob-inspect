@@ -1875,7 +1875,7 @@ pub struct ImportEntry {
     pub global: Option<GlobalEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportEntry {
     pub name: String,
     pub kind: String,

@@ -910,6 +910,10 @@ struct DiffReport {
     custom_sections_removed: Vec<String>,
     /// Always present so callers cannot mistake structural diff for ABI verdict.
     abi_compatibility: &'static str,
+    /// Structural export comparison by resolved signature/bounds, independent
+    /// of `contractspecv0`. Reported separately from the spec-level verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structural_exports: Option<sorob_inspect::soroban::structural::StructuralExportDiff>,
 }
 
 fn key_set(items: impl Iterator<Item = String>) -> BTreeSet<String> {
@@ -947,6 +951,10 @@ fn build_diff(old: &WasmReport, new: &WasmReport) -> DiffReport {
         custom_sections_added: ns.difference(&os).cloned().collect(),
         custom_sections_removed: os.difference(&ns).cloned().collect(),
         abi_compatibility: "not-assessed",
+        structural_exports: Some(sorob_inspect::soroban::structural::diff_exports(
+            &old.exports,
+            &new.exports,
+        )),
     }
 }
 
@@ -1038,6 +1046,47 @@ fn print_diff(old: &Path, new: &Path, d: &DiffReport) {
         && d.exports_removed.is_empty()
     {
         println!("no structural import/export changes");
+    }
+
+    if let Some(se) = &d.structural_exports {
+        if !se.changes.is_empty() {
+            println!();
+            println!("structural export changes (independent of contract spec):");
+            for c in &se.changes {
+                let marker = match c.compatibility {
+                    sorob_inspect::soroban::structural::StructuralCompatibility::Breaking => {
+                        "BREAKING"
+                    }
+                    sorob_inspect::soroban::structural::StructuralCompatibility::NonBreaking => {
+                        "non-breaking"
+                    }
+                    sorob_inspect::soroban::structural::StructuralCompatibility::Unknown => {
+                        "unknown"
+                    }
+                };
+                let action = match c.change {
+                    sorob_inspect::soroban::structural::StructuralChangeKind::Added => "+",
+                    sorob_inspect::soroban::structural::StructuralChangeKind::Removed => "-",
+                    sorob_inspect::soroban::structural::StructuralChangeKind::Changed => "~",
+                    sorob_inspect::soroban::structural::StructuralChangeKind::Unresolved => "?",
+                };
+                match (&c.old, &c.new) {
+                    (Some(o), Some(n)) => {
+                        println!("  {action} {} [{}]: {o} -> {n} ({marker})", c.name, c.kind)
+                    }
+                    (Some(o), None) => {
+                        println!("  {action} {} [{}]: was {o} ({marker})", c.name, c.kind)
+                    }
+                    (None, Some(n)) => {
+                        println!("  {action} {} [{}]: {n} ({marker})", c.name, c.kind)
+                    }
+                    (None, None) => {
+                        println!("  {action} {} [{}] ({marker})", c.name, c.kind)
+                    }
+                }
+            }
+            println!("  structural export compatibility: {}", se.compatibility);
+        }
     }
 
     println!();

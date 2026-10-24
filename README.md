@@ -255,6 +255,65 @@ Semantic equivalence is NOT inferred from matching names alone.
 for a definite verdict (e.g. a discriminant present on only one side). It is
 never downgraded to `non-breaking`.
 
+### Structural export comparison
+
+The `structural_exports` field in the diff JSON reports changes to the raw WASM
+exports (function, memory, table, global), resolved by signature or bounds.
+This comparison is **independent of `contractspecv0`**: it works even when one
+or both modules lack a decodable Soroban spec, and it is not folded into the
+spec-level compatibility verdict.
+
+```json
+"structural_exports": {
+  "compatibility": "breaking",
+  "changes": [
+    {
+      "name": "hello",
+      "kind": "function",
+      "change": "removed",
+      "compatibility": "breaking",
+      "old": "(i64) -> (i64)",
+      "new": null
+    },
+    {
+      "name": "describe",
+      "kind": "function",
+      "change": "added",
+      "compatibility": "non-breaking",
+      "old": null,
+      "new": "(i64) -> (i64)"
+    }
+  ]
+}
+```
+
+Comparison rules:
+
+| Change | Classification | Rationale |
+|--------|----------------|-----------|
+| Export added | non-breaking | New symbol; existing callers unaffected |
+| Export removed | breaking | Existing callers lose access |
+| Export signature/bounds changed | breaking | Callers compiled against the old shape break |
+| Signature unresolvable | unknown | Cannot be classified without inventing a signature |
+
+**Scope and limitations:**
+
+- Exports are keyed by **name + external kind**, not by type index. An index
+  is a position in the declaring module's own type section, so it is not a
+  stable semantic identifier across independently compiled modules.
+- A function export is compared by its *resolved* signature string (already
+  computed by `sorob-inspect` from the module's type section through the full
+  function index space, imports included). When the signature cannot be
+  resolved the change is reported as `unknown` rather than being guessed.
+- Memory, table, and global exports are compared by their collected bounds or
+  value type (`min`, `max`, `is64`, `shared`, `mutable`, etc.).
+- The aggregate `compatibility` is `breaking` when any change is breaking,
+  `unknown` when there are no breaking changes but at least one is unknown,
+  `non-breaking` when every change is an addition, and `identical` when there
+  are no changes.
+- `--fail-on-breaking` continues to gate only the spec-level verdict. Structural
+  export changes do not change the exit code.
+
 ## Compatibility findings (inspect)
 
 `inspect` emits a `findings` array in the JSON `analysis` object. Each finding
