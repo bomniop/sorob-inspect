@@ -38,9 +38,75 @@
 //! | Event topic list changed | breaking | Topic filter changes affect subscribers |
 //! | Event data format changed | breaking | Subscribers parsing payload break |
 
-use crate::soroban::{SpecEvent, SpecFunction, SpecReport, SpecType};
+use crate::soroban::{EnvMetaReport, SpecEvent, SpecFunction, SpecReport, SpecType};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// Result of comparing two contracts' declared environment interface versions.
+///
+/// This is reported as a **distinct signal**, deliberately kept separate from
+/// the spec-level [`Compatibility`] verdict.
+///
+/// A change in `protocol` / `pre_release` is *not* classified as breaking or
+/// non-breaking. Whether a given version is acceptable depends on the target
+/// network's ledger protocol — the Soroban host compares the contract's
+/// declared version against `curr_ledger_protocol`
+/// (`soroban-env-host 28.0.2`, `src/vm/parsed_module.rs:322-395`,
+/// `check_contract_interface_version`), and this tool has no notion of that
+/// ledger protocol. Guessing a verdict here would be unsound, so the change is
+/// surfaced as its own status instead.
+///
+/// `status` is one of:
+/// - `identical` — both decoded, same `protocol` and `pre_release`.
+/// - `changed` — both decoded, values differ.
+/// - `added` — only the new module declares a version.
+/// - `removed` — only the old module declares a version.
+/// - `absent_both` — neither module has a `contractenvmetav0` section.
+/// - `old_undecodable` — old present but undecodable, new decoded.
+/// - `new_undecodable` — new present but undecodable, old decoded.
+/// - `undecodable_both` — both present but undecodable.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnvMetaDiff {
+    /// Outcome class, see the type docs.
+    pub status: String,
+    /// Old side. Omitted when that module had no `contractenvmetav0` section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<EnvMetaReport>,
+    /// New side. Omitted when that module had no `contractenvmetav0` section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<EnvMetaReport>,
+}
+
+/// Compare the decoded environment interface versions of two modules.
+///
+/// `None` on either side means that module had no `contractenvmetav0` section
+/// at all (a normal case for a generic WASM module). A section that is present
+/// but undecodable is passed through as an `EnvMetaReport` with
+/// `status == "undecodable"`.
+pub fn diff_env_meta(old: Option<&EnvMetaReport>, new: Option<&EnvMetaReport>) -> EnvMetaDiff {
+    let status = match (old, new) {
+        (None, None) => "absent_both",
+        (None, Some(_)) => "added",
+        (Some(_), None) => "removed",
+        (Some(o), Some(n)) => match (o.status == "decoded", n.status == "decoded") {
+            (true, true) => {
+                if o.protocol == n.protocol && o.pre_release == n.pre_release {
+                    "identical"
+                } else {
+                    "changed"
+                }
+            }
+            (false, true) => "old_undecodable",
+            (true, false) => "new_undecodable",
+            (false, false) => "undecodable_both",
+        },
+    };
+    EnvMetaDiff {
+        status: status.to_string(),
+        old: old.cloned(),
+        new: new.cloned(),
+    }
+}
 
 /// Result of comparing two decoded contract specs.
 #[derive(Debug, Serialize, Deserialize)]

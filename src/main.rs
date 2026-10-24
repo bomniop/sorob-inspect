@@ -47,7 +47,9 @@ enum Command {
     /// Structural diff between two WASM artifacts.
     ///
     /// Reports added/removed imports, exports, and custom sections, plus a
-    /// spec-level compatibility verdict when both contract specs decode.
+    /// spec-level compatibility verdict when both contract specs decode. Also
+    /// reports the Soroban environment interface-version change as a distinct
+    /// signal (not folded into the breaking/non-breaking verdict).
     Diff {
         /// Old/baseline .wasm file
         old: PathBuf,
@@ -59,6 +61,11 @@ enum Command {
         /// Exit with code 1 when the spec-level compatibility verdict is
         /// `breaking` or `unknown`. Without this flag the exit code is 0
         /// whenever the diff itself ran successfully. Intended for CI gating.
+        ///
+        /// An environment interface-version change does NOT trigger this flag:
+        /// it is reported separately because whether it is acceptable depends
+        /// on the target network's ledger protocol, which this tool does not
+        /// know.
         #[arg(long)]
         fail_on_breaking: bool,
     },
@@ -179,11 +186,23 @@ fn run(cli: Cli) -> Result<(), String> {
                 _ => None,
             };
 
+            // Environment interface version diff: reuse the decoder from the
+            // `validate` path. `None` means the module has no env-meta section.
+            let old_env_meta = sorob_inspect::soroban::decode_env_meta_from_wasm(&old_bytes)
+                .map_err(|e| e.to_string())?;
+            let new_env_meta = sorob_inspect::soroban::decode_env_meta_from_wasm(&new_bytes)
+                .map_err(|e| e.to_string())?;
+            let env_meta_diff = sorob_inspect::soroban::diff::diff_env_meta(
+                old_env_meta.as_ref(),
+                new_env_meta.as_ref(),
+            );
+
             if json {
                 print_json(&serde_json::json!({
                     "schema_version": 1,
                     "structural": diff,
                     "spec": spec_diff,
+                    "env_meta": env_meta_diff,
                 }))?;
             } else {
                 print_diff(&old, &new, &diff);
@@ -236,6 +255,13 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!();
                     println!("spec-level compatibility: unknown (one or both specs could not be decoded)");
                 }
+                // Environment interface version: a distinct signal, deliberately
+                // not folded into the spec-level breaking/non-breaking verdict.
+                println!();
+                println!(
+                    "env interface version: {}",
+                    describe_env_meta_diff(&env_meta_diff)
+                );
             }
             // CI gating: emit the report above, then map the verdict to an exit
             // code. `breaking` and `unknown` both fail; the diff ran fine, so we
@@ -698,6 +724,41 @@ fn build_diff(old: &WasmReport, new: &WasmReport) -> DiffReport {
         custom_sections_added: ns.difference(&os).cloned().collect(),
         custom_sections_removed: os.difference(&ns).cloned().collect(),
         abi_compatibility: "not-assessed",
+    }
+}
+
+/// Render one side of an environment-interface-version comparison.
+fn fmt_env_meta_side(side: Option<&sorob_inspect::soroban::EnvMetaReport>) -> String {
+    match side {
+        None => "absent".to_string(),
+        Some(r) if r.status == "decoded" => format!(
+            "protocol {} (pre-release {})",
+            r.protocol.unwrap_or(0),
+            r.pre_release.unwrap_or(0)
+        ),
+        Some(r) => format!(
+            "undecodable ({})",
+            r.error.clone().unwrap_or_else(|| "no reason".to_string())
+        ),
+    }
+}
+
+/// Human-readable description of an environment-interface-version comparison.
+fn describe_env_meta_diff(d: &sorob_inspect::soroban::diff::EnvMetaDiff) -> String {
+    match d.status.as_str() {
+        "identical" => format!("unchanged ({})", fmt_env_meta_side(d.new.as_ref())),
+        "changed" => format!(
+            "CHANGED {} -> {}",
+            fmt_env_meta_side(d.old.as_ref()),
+            fmt_env_meta_side(d.new.as_ref())
+        ),
+        "added" => format!("added ({})", fmt_env_meta_side(d.new.as_ref())),
+        "removed" => format!("removed (was {})", fmt_env_meta_side(d.old.as_ref())),
+        "absent_both" => "absent in both modules".to_string(),
+        "old_undecodable" => format!("old undecodable, new {}", fmt_env_meta_side(d.new.as_ref())),
+        "new_undecodable" => format!("new undecodable, old {}", fmt_env_meta_side(d.old.as_ref())),
+        "undecodable_both" => "undecodable in both modules".to_string(),
+        other => other.to_string(),
     }
 }
 

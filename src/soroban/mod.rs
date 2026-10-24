@@ -52,7 +52,7 @@ pub struct SorobanReport {
 /// (`soroban-env-host 28.0.2`, `src/vm/parsed_module.rs:472-500`,
 /// `check_meta_section`). The host then checks the version against the ledger
 /// protocol (`:322-395`, `check_contract_interface_version`).
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EnvMetaReport {
     /// `decoded` when the first entry was an interface version, or
     /// `undecodable` when the section existed but could not be read.

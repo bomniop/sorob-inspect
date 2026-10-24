@@ -1868,3 +1868,161 @@ fn cli_validate_non_soroban_module_emits_valid_json() {
         .get("total_function_count")
         .is_some());
 }
+
+// --- env interface version diff (contractenvmetav0) ---
+
+/// Locate the `contractenvmetav0` custom-section payload and overwrite its
+/// XDR-encoded `protocol` (u32 BE, payload+4..+8) and `pre_release`
+/// (u32 BE, payload+8..+12) fields. Panics if the section is absent.
+fn patch_env_meta(wasm: &mut [u8], new_proto: u32, new_pre: u32) {
+    let mut i = 8;
+    while i < wasm.len() {
+        let id = wasm[i];
+        i += 1;
+        let mut size: usize = 0;
+        let mut shift = 0;
+        loop {
+            let b = wasm[i];
+            i += 1;
+            size |= ((b & 0x7F) as usize) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let body_start = i;
+        let body_end = i + size;
+        if id == 0 {
+            let name_len = wasm[body_start] as usize;
+            let name =
+                std::str::from_utf8(&wasm[body_start + 1..body_start + 1 + name_len]).unwrap();
+            if name == "contractenvmetav0" {
+                let payload_off = body_start + 1 + name_len;
+                wasm[payload_off + 4..payload_off + 8].copy_from_slice(&new_proto.to_be_bytes());
+                wasm[payload_off + 8..payload_off + 12].copy_from_slice(&new_pre.to_be_bytes());
+                return;
+            }
+        }
+        i = body_end;
+    }
+    panic!("contractenvmetav0 section not found");
+}
+
+#[test]
+fn test_diff_env_meta_identical_in_json() {
+    // Two real Soroban fixtures both declare protocol 28 / pre-release 0.
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        "tests/fixtures/udt_contract_c.wasm",
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["env_meta"]["status"], "identical");
+    assert_eq!(v["env_meta"]["old"]["protocol"], 28);
+    assert_eq!(v["env_meta"]["old"]["pre_release"], 0);
+    assert_eq!(v["env_meta"]["new"]["protocol"], 28);
+    assert_eq!(v["env_meta"]["new"]["pre_release"], 0);
+}
+
+#[test]
+fn test_diff_env_meta_changed_in_json() {
+    // Byte-patch a copy of a real fixture to protocol 27 / pre-release 1.
+    let mut bytes = std::fs::read("tests/fixtures/test_soroban.wasm").unwrap();
+    patch_env_meta(&mut bytes, 27, 1);
+    let patched = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(patched.path(), &bytes).unwrap();
+    let patched_path = patched.path().to_string_lossy().to_string();
+
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        &patched_path,
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["env_meta"]["status"], "changed");
+    assert_eq!(v["env_meta"]["old"]["protocol"], 28);
+    assert_eq!(v["env_meta"]["new"]["protocol"], 27);
+    assert_eq!(v["env_meta"]["new"]["pre_release"], 1);
+}
+
+#[test]
+fn test_diff_env_meta_changed_text_reports_change() {
+    // The human-readable path must surface the version change.
+    let mut bytes = std::fs::read("tests/fixtures/test_soroban.wasm").unwrap();
+    patch_env_meta(&mut bytes, 27, 1);
+    let patched = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(patched.path(), &bytes).unwrap();
+    let patched_path = patched.path().to_string_lossy().to_string();
+
+    let (_rc, stdout, _) = run_cli(&["diff", "tests/fixtures/test_soroban.wasm", &patched_path]);
+    assert!(
+        stdout.contains("env interface version: CHANGED"),
+        "text path reports the change"
+    );
+}
+
+#[test]
+fn test_diff_env_meta_removed_when_new_has_no_section() {
+    // A generic non-Soroban WASM has no contractenvmetav0 section.
+    let empty = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(
+        empty.path(),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    )
+    .expect("write empty wasm");
+    let empty_path = empty.path().to_string_lossy().to_string();
+
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        &empty_path,
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["env_meta"]["status"], "removed");
+    assert_eq!(v["env_meta"]["old"]["protocol"], 28);
+    // `new` is omitted when that module has no section.
+    assert!(v["env_meta"].get("new").is_none());
+}
+
+#[test]
+fn test_diff_env_meta_change_does_not_trigger_fail_on_breaking() {
+    // A version change is a distinct signal; it must not be folded into the
+    // spec-level breaking/non-breaking verdict that --fail-on-breaking gates.
+    let mut bytes = std::fs::read("tests/fixtures/udt_contract_c.wasm").unwrap();
+    patch_env_meta(&mut bytes, 27, 0);
+    let patched = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(patched.path(), &bytes).unwrap();
+    let patched_path = patched.path().to_string_lossy().to_string();
+
+    // udt_contract_c and udt_contract_d differ only by one spec field (a
+    // non-breaking addition), so without the version-change the verdict is
+    // non-breaking and the flag must NOT fail the build.
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/udt_contract_c.wasm",
+        &patched_path,
+        "--json",
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(rc, 0, "version change must not trigger --fail-on-breaking");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["env_meta"]["status"], "changed");
+}

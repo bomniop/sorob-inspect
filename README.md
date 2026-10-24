@@ -367,6 +367,37 @@ means the shape changed.
 `spec.types_changed[].uncertain` is emitted only when true, marking changes that
 forced the overall `unknown` verdict.
 
+### Environment interface-version diff
+
+`diff --json` reports each side's `contractenvmetav0` environment interface
+version under an `env_meta` key. This is a **distinct signal** — it is *not*
+folded into the `spec.compatibility` verdict. An interface-version change is
+not classified as breaking or non-breaking: whether a given `protocol` /
+`pre_release` is acceptable depends on the target network's ledger protocol,
+which this tool does not know.
+
+```json
+"env_meta": {
+  "status": "changed",
+  "old": { "status": "decoded", "protocol": 28, "pre_release": 0 },
+  "new": { "status": "decoded", "protocol": 27, "pre_release": 1 }
+}
+```
+
+`status` (and the `old`/`new` reports, omitted when that module has no
+`contractenvmetav0` section) is one of:
+
+- `identical` — both sides decoded the same `protocol` and `pre_release`.
+- `changed` — both sides decoded but values differ.
+- `added` — only the new module declares a version.
+- `removed` — only the old module declares a version.
+- `absent_both` — neither module has a `contractenvmetav0` section.
+- `old_undecodable` / `new_undecodable` / `undecodable_both` — the section was
+  present but could not be decoded.
+
+Because `--fail-on-breaking` gates only the spec-level verdict, an interface-
+version change never changes the `diff` exit code.
+
 `spec.events[]` carries the event's data format in `data_format`, decoded from
 the spec XDR (`ScSpecEventDataFormat`). All three values are represented:
 
