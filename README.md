@@ -5,7 +5,7 @@ Inspect, validate, and diff Soroban WASM artifacts from the command line.
 ## What this tool does today
 
 - `inspect` — parse a `.wasm` file and report imports (with structured function/memory/table/global details), exports, custom sections, defined function signatures, a module-structure summary (memory limits, table bounds, global types, data/element segment counts, start function), a per-function code-body metrics block (body size, locals, operator count, instruction inventory, control nesting), the static direct-call graph, defined-function reachability, and a consolidated summary rollup of those counts.
-- `validate` — run generic WASM validation, detect Soroban contract markers (`contractspecv0`, `contractenvmetav0`), and decode the contract spec into structured data (functions, params, return types, UDTs, events) via `stellar-xdr`.
+- `validate` — run generic WASM validation, detect Soroban contract markers (`contractspecv0`, `contractenvmetav0`), decode the contract spec into structured data (functions, params, return types, UDTs, events), and decode the contract's declared **environment interface version** from `contractenvmetav0`, all via `stellar-xdr`.
 - `diff` — structural diff (imports/exports/custom sections) plus spec-level compatibility diff when both sides decode successfully.
 
 Stable JSON output is available for every command via `--json`.
@@ -85,6 +85,30 @@ The report has a `status` field — `checked`, or `not_applicable` (with a
 `reason`) when there is no decodable spec. `checked` plus empty `findings`
 means no implemented rule reported a mismatch, not that the ABI is compatible;
 `not_checked` lists the areas that were never evaluated.
+
+## Environment interface version (`validate`)
+
+`validate` also decodes `contractenvmetav0`, the section carrying the contract's
+declared environment interface version, and reports it as `env_meta`:
+
+```json
+"env_meta": { "status": "decoded", "protocol": 28, "pre_release": 0 }
+```
+
+- `status` is `decoded` when the section's first `ScEnvMetaEntry` is an
+  `SC_ENV_META_KIND_INTERFACE_VERSION`, or `undecodable` when the section exists
+  but cannot be read (with an `error` explaining why).
+- `protocol` / `pre_release` are present only when `status` is `decoded`.
+- When the module has no `contractenvmetav0` section the field is omitted
+  entirely — absence is not reported as a zero version.
+
+This mirrors the host's own rule: `soroban-env-host 28.0.2`
+(`src/vm/parsed_module.rs:472-500`, `check_meta_section`) requires the section
+and its first entry to be an interface version, then validates `protocol` /
+`pre_release` against the ledger protocol (`:322-395`,
+`check_contract_interface_version`). This tool reports the declared version; it
+does not know the target network's ledger protocol, so it makes no
+compatibility verdict on the version itself.
 
 ## Compatibility diff rules
 

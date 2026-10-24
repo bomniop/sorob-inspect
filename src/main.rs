@@ -110,6 +110,21 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!("spec types: {}", spec.types.len());
                     println!("spec events: {}", spec.events.len());
                 }
+                if let Some(em) = &report.env_meta {
+                    if em.status == "decoded" {
+                        println!(
+                            "env interface version: protocol {} (pre-release {})",
+                            em.protocol.unwrap_or(0),
+                            em.pre_release.unwrap_or(0)
+                        );
+                    } else {
+                        println!(
+                            "env metadata: {} ({})",
+                            em.status,
+                            em.error.clone().unwrap_or_default()
+                        );
+                    }
+                }
                 if let Some(c) = &report.consistency {
                     println!("--- spec/export consistency ---");
                     println!("  status: {}", c.status);

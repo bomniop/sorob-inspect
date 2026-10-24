@@ -13,7 +13,7 @@ pub mod diff;
 use crate::wasm::{inspect, InspectError, WasmReport};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
-use stellar_xdr::{Limited, Limits, ReadXdr, ScSpecEntry, ScSpecTypeDef};
+use stellar_xdr::{Limited, Limits, ReadXdr, ScEnvMetaEntry, ScSpecEntry, ScSpecTypeDef};
 
 /// Maximum size of a `contractspecv0` payload we will attempt to decode.
 const MAX_SPEC_LEN: usize = 0x1000000; // 16 MiB, matches soroban-spec Limits.len
@@ -36,8 +36,37 @@ pub struct SorobanReport {
     /// available (or attempted) so consumers can see what was compared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consistency: Option<crate::soroban::consistency::ConsistencyReport>,
+    /// Decoded Soroban environment metadata (`contractenvmetav0`): the contract's
+    /// declared interface version. Present only when that section exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_meta: Option<EnvMetaReport>,
     /// Human-readable summary of Soroban-relevant observations.
     pub summary: String,
+}
+
+/// Decoded Soroban environment metadata (`contractenvmetav0`).
+///
+/// The section carries an XDR stream of `ScEnvMetaEntry` unions. The Soroban
+/// host requires the section to exist and its first entry to be an
+/// `SC_ENV_META_KIND_INTERFACE_VERSION`; otherwise instantiation fails
+/// (`soroban-env-host 28.0.2`, `src/vm/parsed_module.rs:472-500`,
+/// `check_meta_section`). The host then checks the version against the ledger
+/// protocol (`:322-395`, `check_contract_interface_version`).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct EnvMetaReport {
+    /// `decoded` when the first entry was an interface version, or
+    /// `undecodable` when the section existed but could not be read.
+    pub status: String,
+    /// Declared protocol number. Present only when `status` is `decoded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<u32>,
+    /// Declared pre-release number (0 for finalized protocols). Present only
+    /// when `status` is `decoded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_release: Option<u32>,
+    /// Why decoding failed. Present only when `status` is `undecodable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Decoded contract-spec contents.
@@ -208,7 +237,11 @@ pub fn inspect_soroban(bytes: &[u8], validate: bool) -> Result<SorobanReport, So
         None
     };
 
-    let summary = match (&spec, has_contract_spec, has_contract_env_meta) {
+    // Environment metadata: the Soroban host requires this section and reads the
+    // contract's declared interface version from its first entry.
+    let env_meta = decode_env_meta_from_wasm(bytes)?;
+
+    let mut summary = match (&spec, has_contract_spec, has_contract_env_meta) {
         (Some(s), true, true) => format!(
             "Soroban contract artifact: {} function(s), {} type(s), {} event(s) decoded from contractspecv0.",
             s.functions.len(),
@@ -227,12 +260,25 @@ pub fn inspect_soroban(bytes: &[u8], validate: bool) -> Result<SorobanReport, So
         }
     };
 
+    if let Some(em) = &env_meta {
+        if em.status == "decoded" {
+            summary.push_str(&format!(
+                " Environment interface version: protocol {} (pre-release {}).",
+                em.protocol.unwrap_or(0),
+                em.pre_release.unwrap_or(0)
+            ));
+        } else {
+            summary.push_str(" Environment metadata section present but not decodable.");
+        }
+    }
+
     Ok(SorobanReport {
         wasm,
         has_contract_spec,
         has_contract_env_meta,
         spec,
         consistency,
+        env_meta,
         summary,
     })
 }
@@ -247,6 +293,73 @@ pub fn decode_spec_from_wasm(bytes: &[u8]) -> Result<SpecReport, SorobanError> {
     decode_spec_raw(&raw)
 }
 
+/// Extract the `contractenvmetav0` custom-section payload, if present.
+///
+/// Returns `Ok(None)` when the section is absent. A present section is never
+/// serialized; only its decoded version is reported.
+fn extract_env_meta_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>, SorobanError> {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload =
+            payload.map_err(|e| SorobanError::Wasm(InspectError::Malformed(e.to_string())))?;
+        if let wasmparser::Payload::CustomSection(section) = payload {
+            if section.name() == "contractenvmetav0" {
+                return Ok(Some(section.data().to_vec()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Decode the Soroban environment interface version from a module.
+///
+/// Returns `Ok(None)` when the module has no `contractenvmetav0` section. When
+/// the section exists, its first `ScEnvMetaEntry` must be an
+/// `ScEnvMetaKindInterfaceVersion` — the same rule the Soroban host enforces
+/// (`soroban-env-host 28.0.2`, `src/vm/parsed_module.rs:472-500`). A section
+/// that cannot be read is reported as `undecodable` rather than treated as an
+/// error, so a malformed section is visible without aborting the whole report.
+pub fn decode_env_meta_from_wasm(bytes: &[u8]) -> Result<Option<EnvMetaReport>, SorobanError> {
+    let Some(raw) = extract_env_meta_bytes(bytes)? else {
+        return Ok(None);
+    };
+    Ok(Some(decode_env_meta_raw(&raw)))
+}
+
+/// Decode raw `contractenvmetav0` bytes into an [`EnvMetaReport`].
+pub fn decode_env_meta_raw(raw: &[u8]) -> EnvMetaReport {
+    let mut limited = Limited::new(
+        Cursor::new(raw),
+        Limits {
+            depth: MAX_SPEC_DEPTH,
+            len: raw.len(),
+        },
+    );
+    match ScEnvMetaEntry::read_xdr_iter(&mut limited).next() {
+        // `ScEnvMetaEntry` has exactly one variant, so a successfully decoded
+        // entry is always an interface version. A wrong discriminant fails
+        // decoding and surfaces through the `Some(Err(_))` arm below.
+        Some(Ok(ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(v))) => EnvMetaReport {
+            status: "decoded".to_string(),
+            protocol: Some(v.protocol),
+            pre_release: Some(v.pre_release),
+            error: None,
+        },
+        Some(Err(e)) => EnvMetaReport {
+            status: "undecodable".to_string(),
+            protocol: None,
+            pre_release: None,
+            error: Some(format!("contractenvmetav0 decode failed: {e}")),
+        },
+        None => EnvMetaReport {
+            status: "undecodable".to_string(),
+            protocol: None,
+            pre_release: None,
+            error: Some("contractenvmetav0 is empty".to_string()),
+        },
+    }
+}
+
+/// Extract the `contractspecv0` custom-section payload.
 fn extract_spec_bytes(bytes: &[u8]) -> Result<Vec<u8>, SorobanError> {
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         let payload =
@@ -563,5 +676,139 @@ mod tests {
         // Valid discriminant, truncated body.
         let result = decode_spec_raw(&[0x00, 0x00, 0x00, 0x00, 0x00]);
         assert!(matches!(result, Err(SorobanError::SpecDecode(_))));
+    }
+
+    // --- contractenvmetav0 (environment interface version) tests ---
+
+    /// Build a `contractenvmetav0` payload: the interface-version union as
+    /// `int32 discriminant 0` + `uint32 protocol` + `uint32 pre_release`, all
+    /// big-endian, matching `soroban-env-host`'s framing.
+    fn env_meta_payload(protocol: u32, pre_release: u32) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x00, 0x00];
+        v.extend_from_slice(&protocol.to_be_bytes());
+        v.extend_from_slice(&pre_release.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn env_meta_decodes_interface_version() {
+        let em = decode_env_meta_raw(&env_meta_payload(21, 0));
+        assert_eq!(em.status, "decoded");
+        assert_eq!(em.protocol, Some(21));
+        assert_eq!(em.pre_release, Some(0));
+        assert!(em.error.is_none());
+    }
+
+    #[test]
+    fn env_meta_decodes_nonzero_prerelease() {
+        // Pre-release numbers are meaningful for not-yet-finalized protocols.
+        let em = decode_env_meta_raw(&env_meta_payload(22, 1));
+        assert_eq!(em.status, "decoded");
+        assert_eq!(em.protocol, Some(22));
+        assert_eq!(em.pre_release, Some(1));
+    }
+
+    #[test]
+    fn env_meta_empty_section_is_undecodable_not_panic() {
+        // The host rejects an empty section ("contract missing environment
+        // interface version"); the report must surface it, not crash.
+        let em = decode_env_meta_raw(&[]);
+        assert_eq!(em.status, "undecodable");
+        assert!(em.protocol.is_none());
+        assert!(em.pre_release.is_none());
+        assert!(em.error.is_some());
+    }
+
+    #[test]
+    fn env_meta_truncated_section_is_undecodable_not_panic() {
+        let em = decode_env_meta_raw(&[0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(em.status, "undecodable");
+        assert!(em.error.is_some());
+    }
+
+    #[test]
+    fn env_meta_wrong_discriminant_is_undecodable_not_panic() {
+        // A discriminant other than 0 is not an interface version.
+        let mut payload = vec![0x00, 0x00, 0x00, 0x01];
+        payload.extend_from_slice(&21u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        let em = decode_env_meta_raw(&payload);
+        assert_eq!(em.status, "undecodable");
+        assert!(em.error.is_some());
+    }
+
+    #[test]
+    fn env_meta_from_wasm_absent_section_is_none() {
+        // Generic module without the section: absent, not an error.
+        let wasm = wasm_with_spec_section_size(0);
+        let em = decode_env_meta_from_wasm(&wasm).expect("no error when section absent");
+        assert!(em.is_none());
+    }
+
+    #[test]
+    fn env_meta_from_wasm_decodes_present_section() {
+        // A module whose only custom section is contractenvmetav0.
+        let name = b"contractenvmetav0";
+        let payload = env_meta_payload(21, 0);
+        let mut buf = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        buf.push(0x00); // custom-section id
+        let section_len = 1 + name.len() + payload.len();
+        let mut n = section_len as u64;
+        loop {
+            let mut byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                byte |= 0x80;
+            }
+            buf.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(&payload);
+
+        let em = decode_env_meta_from_wasm(&buf).expect("decodes");
+        let em = em.expect("section present");
+        assert_eq!(em.status, "decoded");
+        assert_eq!(em.protocol, Some(21));
+        assert_eq!(em.pre_release, Some(0));
+    }
+
+    #[test]
+    fn env_meta_is_reported_on_inspect_soroban() {
+        // End-to-end: the decoded version reaches the report and the summary.
+        let name = b"contractenvmetav0";
+        let payload = env_meta_payload(21, 0);
+        let mut buf = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        buf.push(0x00);
+        let section_len = 1 + name.len() + payload.len();
+        let mut n = section_len as u64;
+        loop {
+            let mut byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                byte |= 0x80;
+            }
+            buf.push(byte);
+            if n == 0 {
+                break;
+            }
+        }
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(&payload);
+
+        let report = inspect_soroban(&buf, false).expect("parses");
+        assert!(report.has_contract_env_meta);
+        let em = report.env_meta.expect("env meta present");
+        assert_eq!(em.status, "decoded");
+        assert_eq!(em.protocol, Some(21));
+        assert!(
+            report.summary.contains("protocol 21"),
+            "summary must mention the decoded version: {}",
+            report.summary
+        );
     }
 }
