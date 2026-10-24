@@ -92,13 +92,16 @@ means no implemented rule reported a mismatch, not that the ABI is compatible;
 declared environment interface version, and reports it as `env_meta`:
 
 ```json
-"env_meta": { "status": "decoded", "protocol": 28, "pre_release": 0 }
+"env_meta": { "status": "decoded", "protocol": 28, "pre_release": 0, "diagnostic": "..." }
 ```
 
 - `status` is `decoded` when the section's first `ScEnvMetaEntry` is an
   `SC_ENV_META_KIND_INTERFACE_VERSION`, or `undecodable` when the section exists
   but cannot be read (with an `error` explaining why).
 - `protocol` / `pre_release` are present only when `status` is `decoded`.
+- `diagnostic` is present only when `status` is `decoded`, and carries the
+  host's acceptance rule plus the inputs needed to evaluate the version. It is
+  guidance, **not** a verdict (see below).
 - When the module has no `contractenvmetav0` section the field is omitted
   entirely — absence is not reported as a zero version.
 
@@ -106,9 +109,27 @@ This mirrors the host's own rule: `soroban-env-host 28.0.2`
 (`src/vm/parsed_module.rs:472-500`, `check_meta_section`) requires the section
 and its first entry to be an interface version, then validates `protocol` /
 `pre_release` against the ledger protocol (`:322-395`,
-`check_contract_interface_version`). This tool reports the declared version; it
-does not know the target network's ledger protocol, so it makes no
-compatibility verdict on the version itself.
+`check_contract_interface_version`).
+
+### Why there is no compatibility verdict for the version
+
+SorobInspect reports the declared version and explains how it is evaluated; it
+does not decide acceptance. The host's check
+(`check_contract_interface_version`) compares `got_proto` (the module's declared
+protocol) against `want_proto = min(curr_ledger_protocol, host_protocol)`:
+
+| Condition | Host outcome |
+| --- | --- |
+| `got_proto > want_proto` | rejected — "contract protocol number is newer than host" |
+| `got_proto == want_proto` | accepted only when `pre_release` equals the host's compiled `pre_release` |
+| `got_proto < want_proto` | accepted only when `pre_release` is `0` (older protocols are finalized) |
+
+Evaluating this needs two inputs SorobInspect has no access to: the target
+network's current ledger protocol, and the running host's compiled interface
+version. The CLI accepts neither, and this tool does not perform a network
+lookup to guess them. Rather than emit an unsound verdict, the decoded value is
+reported with the `diagnostic` text above so the operator can evaluate it
+against their target network.
 
 ## Compatibility diff rules
 
@@ -379,10 +400,14 @@ which this tool does not know.
 ```json
 "env_meta": {
   "status": "changed",
-  "old": { "status": "decoded", "protocol": 28, "pre_release": 0 },
-  "new": { "status": "decoded", "protocol": 27, "pre_release": 1 }
+  "old": { "status": "decoded", "protocol": 28, "pre_release": 0, "diagnostic": "..."},
+  "new": { "status": "decoded", "protocol": 27, "pre_release": 1, "diagnostic": "..."}
 }
 ```
+
+Each decoded side carries the same `diagnostic` guidance as `validate`; a version
+change is reported as a distinct signal, not as a breaking/non-breaking
+verdict (see [Why there is no compatibility verdict](#why-there-is-no-compatibility-verdict-for-the-version)).
 
 `status` (and the `old`/`new` reports, omitted when that module has no
 `contractenvmetav0` section) is one of:

@@ -2026,3 +2026,95 @@ fn test_diff_env_meta_change_does_not_trigger_fail_on_breaking() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["env_meta"]["status"], "changed");
 }
+
+#[test]
+fn test_validate_env_meta_diagnostic_in_json() {
+    // A decoded version surfaces the host's acceptance rule + required inputs,
+    // never a verdict.
+    let (rc, stdout, _) = run_cli(&["validate", "tests/fixtures/test_soroban.wasm", "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let em = &v["env_meta"];
+    assert_eq!(em["status"], "decoded");
+    let diag = em
+        .get("diagnostic")
+        .and_then(|d| d.as_str())
+        .expect("decoded version carries a diagnostic");
+    assert!(
+        diag.contains("check_contract_interface_version"),
+        "rule is cited"
+    );
+    assert!(
+        diag.contains("curr_ledger_protocol"),
+        "required input named"
+    );
+    assert!(diag.contains("host_protocol"), "host input named");
+    assert!(
+        !diag.contains("will be accepted") && !diag.contains("will be rejected"),
+        "diagnostic is guidance, not a verdict"
+    );
+}
+
+#[test]
+fn test_diff_env_meta_diagnostic_per_side() {
+    // In a diff, each decoded side carries its own diagnostic.
+    let (rc, stdout, _) = run_cli(&[
+        "diff",
+        "tests/fixtures/test_soroban.wasm",
+        "tests/fixtures/udt_contract_c.wasm",
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let old_diag = &v["env_meta"]["old"]["diagnostic"];
+    let new_diag = &v["env_meta"]["new"]["diagnostic"];
+    assert!(old_diag.is_string(), "old side carries diagnostic");
+    assert!(new_diag.is_string(), "new side carries diagnostic");
+    assert!(
+        old_diag.as_str().unwrap().contains("curr_ledger_protocol"),
+        "old diagnostic cites the rule"
+    );
+    assert!(
+        v["env_meta"]["status"] == "identical",
+        "same versions are identical"
+    );
+}
+
+#[test]
+fn test_validate_env_meta_text_has_actionable_hint() {
+    // The human-readable path tells the operator what to do next.
+    let (rc, stdout, _) = run_cli(&["validate", "tests/fixtures/test_soroban.wasm"]);
+    assert_eq!(rc, 0);
+    assert!(
+        stdout.contains("env interface version: protocol 28 (pre-release 0)"),
+        "version is printed"
+    );
+    assert!(
+        stdout.contains("evaluate against the target network's ledger protocol"),
+        "actionable hint is printed"
+    );
+}
+
+#[test]
+fn test_diff_env_meta_changed_text_has_hint() {
+    // When versions differ, the text path surfaces the change + the hint.
+    let mut bytes = std::fs::read("tests/fixtures/test_soroban.wasm").unwrap();
+    patch_env_meta(&mut bytes, 27, 0);
+    let patched = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(patched.path(), &bytes).unwrap();
+    let patched_path = patched.path().to_string_lossy().to_string();
+
+    let (rc, stdout, _) = run_cli(&["diff", "tests/fixtures/test_soroban.wasm", &patched_path]);
+    assert_eq!(rc, 0);
+    assert!(
+        stdout.contains("env interface version: CHANGED"),
+        "text reports the change"
+    );
+    assert!(
+        stdout.contains("evaluate against the target network's ledger protocol"),
+        "text reports the actionable hint"
+    );
+}

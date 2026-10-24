@@ -124,6 +124,10 @@ fn run(cli: Cli) -> Result<(), String> {
                             em.protocol.unwrap_or(0),
                             em.pre_release.unwrap_or(0)
                         );
+                        println!(
+                            "  -> evaluate against the target network's ledger protocol \
+                             (see env_meta.diagnostic in --json for the host's rule)"
+                        );
                     } else {
                         println!(
                             "env metadata: {} ({})",
@@ -262,6 +266,15 @@ fn run(cli: Cli) -> Result<(), String> {
                     "env interface version: {}",
                     describe_env_meta_diff(&env_meta_diff)
                 );
+                if matches!(
+                    env_meta_diff.status.as_str(),
+                    "changed" | "added" | "removed"
+                ) {
+                    println!(
+                        "  -> evaluate against the target network's ledger protocol \
+                         (see env_meta.diagnostic in --json for the host's rule)"
+                    );
+                }
             }
             // CI gating: emit the report above, then map the verdict to an exit
             // code. `breaking` and `unknown` both fail; the diff ran fine, so we

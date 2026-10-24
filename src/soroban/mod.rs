@@ -67,7 +67,38 @@ pub struct EnvMetaReport {
     /// Why decoding failed. Present only when `status` is `undecodable`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Actionable guidance for evaluating `protocol` / `pre_release` against a
+    /// target network. Present only when `status` is `decoded`.
+    ///
+    /// This is documentation, **not** a verdict: see
+    /// [`INTERFACE_VERSION_DIAGNOSTIC`] for why no verdict can be rendered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
+
+/// Actionable guidance attached to every decoded interface version.
+///
+/// This describes the host's acceptance rule verbatim; it is *not* a
+/// compatibility verdict. SorobInspect cannot decide acceptance because the
+/// rule needs two inputs it has no access to: the target network's current
+/// ledger protocol and the running host's compiled interface version. Rather
+/// than guess (or perform an unverified network lookup), the decoded value is
+/// reported together with this guidance so the operator can evaluate it.
+///
+/// Rule source: `soroban-env-host 28.0.2`, `src/vm/parsed_module.rs`,
+/// `check_contract_interface_version` (lines 322-400).
+pub const INTERFACE_VERSION_DIAGNOSTIC: &str = "\
+The Soroban host accepts a module only in the context of a target ledger \
+protocol. Its check (soroban-env-host 28.0.2, src/vm/parsed_module.rs, \
+check_contract_interface_version) compares got_proto (this module's declared \
+protocol) against want_proto = min(curr_ledger_protocol, host_protocol): \
+(1) got_proto > want_proto is rejected as \"contract protocol number is newer \
+than host\"; (2) got_proto == want_proto is accepted only when pre_release \
+equals the host's compiled pre_release; (3) got_proto < want_proto is accepted \
+only when pre_release is 0 (older protocols are finalized). This tool has no \
+access to the target ledger protocol or to the running host's interface \
+version, so it cannot decide acceptance. Evaluate this value against the target \
+network's current ledger protocol.";
 
 /// Decoded contract-spec contents.
 #[derive(Debug, Serialize, Deserialize)]
@@ -343,18 +374,21 @@ pub fn decode_env_meta_raw(raw: &[u8]) -> EnvMetaReport {
             protocol: Some(v.protocol),
             pre_release: Some(v.pre_release),
             error: None,
+            diagnostic: Some(INTERFACE_VERSION_DIAGNOSTIC.to_string()),
         },
         Some(Err(e)) => EnvMetaReport {
             status: "undecodable".to_string(),
             protocol: None,
             pre_release: None,
             error: Some(format!("contractenvmetav0 decode failed: {e}")),
+            diagnostic: None,
         },
         None => EnvMetaReport {
             status: "undecodable".to_string(),
             protocol: None,
             pre_release: None,
             error: Some("contractenvmetav0 is empty".to_string()),
+            diagnostic: None,
         },
     }
 }

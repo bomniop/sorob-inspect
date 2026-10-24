@@ -8,6 +8,7 @@ fn decoded(protocol: u32, pre_release: u32) -> EnvMetaReport {
         protocol: Some(protocol),
         pre_release: Some(pre_release),
         error: None,
+        diagnostic: Some(sorob_inspect::soroban::INTERFACE_VERSION_DIAGNOSTIC.to_string()),
     }
 }
 
@@ -17,6 +18,7 @@ fn undecodable() -> EnvMetaReport {
         protocol: None,
         pre_release: None,
         error: Some("bad payload".to_string()),
+        diagnostic: None,
     }
 }
 
@@ -126,4 +128,26 @@ fn env_meta_diff_json_shape_is_stable() {
     assert_eq!(und["status"], "old_undecodable");
     assert!(und["old"].get("protocol").is_none());
     assert_eq!(und["old"]["error"], "bad payload");
+}
+
+#[test]
+fn env_meta_diagnostic_attached_to_decoded_only() {
+    // A decoded side carries an actionable `diagnostic` with the host's rule.
+    let r = decoded(28, 0);
+    assert_eq!(r.status, "decoded");
+    let d = r.diagnostic.expect("decoded carries a diagnostic");
+    assert!(d.contains("check_contract_interface_version"));
+    assert!(d.contains("curr_ledger_protocol"));
+    assert!(d.contains("host_protocol"));
+    assert!(
+        !d.contains("accept") || d.contains("cannot decide"),
+        "diagnostic is guidance, not a verdict"
+    );
+
+    // An undecodable side carries no diagnostic (there is no decoded version to evaluate).
+    let u = undecodable();
+    assert!(
+        u.diagnostic.is_none(),
+        "undecodable has no version to evaluate"
+    );
 }
