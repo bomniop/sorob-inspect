@@ -325,6 +325,15 @@ mean the module is guaranteed Soroban-compatible.
 |------|----------|-------------------|
 | `float_ops` | incompatible | Soroban host rejects WASM containing float instructions. Detected by validating the module with `floats: false` and observing a failure that the unrestricted validator accepts. Evidence: `soroban-env-host` pre-validates every uploaded module with `wasmparser::validate` (`src/vm/parsed_module.rs`) and its e2e suite asserts float WASM upload fails (`test_wasm_upload_failure_due_to_unsupported_wasm_features`). |
 | `memory64` | unsupported | A memory declared with 64-bit indices. The host's pre-validation uses default `wasmparser` feature flags, where `memory64` is off by default. |
+| `export_unresolvable` | unknown | An exported symbol whose resolved description is unavailable. For a function export the signature could not be resolved from the module's type section; for a memory/table/global export the corresponding detail was not collected. Reported as `unknown`, never as breaking: an unresolved signature is a limitation of the input, not evidence of a defect. |
+
+### Single-module export observations vs. baseline-relative changes
+
+`inspect` reports only what a single module establishes on its own. It never
+emits `export_added`, `export_removed`, or `export_signature_changed`, because
+those require a comparison baseline that one module cannot provide. Use `diff`
+against a reference module for baseline-relative changes; see
+[Structural export comparison](#structural-export-comparison).
 
 Rules deliberately **not** implemented, because the repository has no verified
 Soroban rule for them: SIMD, threads, exceptions, GC, component model, tail

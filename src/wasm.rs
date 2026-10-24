@@ -1802,7 +1802,7 @@ pub struct GlobalEntry {
 }
 
 /// A single compatibility or resource finding.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Finding {
     /// Stable machine-readable code (e.g. `float_ops`, `memory64`).
     pub code: String,

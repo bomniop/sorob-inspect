@@ -2714,3 +2714,92 @@ fn test_structural_export_diff_does_not_affect_fail_on_breaking() {
     );
     assert_eq!(v["spec"]["compatibility"], "breaking");
 }
+
+// --- inspect: single-module export observations ---
+
+#[test]
+fn test_inspect_exports_no_findings_when_all_resolve() {
+    let (rc, stdout, _) = run_cli(&["inspect", "tests/fixtures/test_soroban.wasm", "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let findings = &v["analysis"]["findings"];
+    let export_findings: Vec<_> = findings
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"].as_str().unwrap_or("").starts_with("export_"))
+        .collect();
+    assert!(
+        export_findings.is_empty(),
+        "no export findings when all exports resolve: {:?}",
+        export_findings
+    );
+    assert_eq!(
+        v["summary"]["analysis_finding_count"],
+        findings.as_array().unwrap().len()
+    );
+}
+
+#[test]
+fn test_inspect_exports_unresolvable_signature_produces_finding() {
+    // Fixture: real contract with the function's type index patched out of
+    // range, so the signature cannot be resolved from the type section.
+    let (rc, stdout, _) = run_cli(&["inspect", "/tmp/bad_type_idx.wasm", "--json"]);
+    assert_eq!(rc, 0, "inspect must not fail on unresolvable exports");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let findings = &v["analysis"]["findings"];
+    let export_findings: Vec<_> = findings
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"].as_str().unwrap_or("").starts_with("export_"))
+        .collect();
+    assert!(
+        !export_findings.is_empty(),
+        "expected at least one export finding"
+    );
+    assert_eq!(
+        export_findings[0]["code"], "export_unresolvable",
+        "code must be export_unresolvable"
+    );
+    assert_eq!(
+        export_findings[0]["severity"], "unknown",
+        "unresolvable export is unknown, not breaking"
+    );
+    assert!(
+        export_findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no resolvable description"),
+        "message explains the limitation"
+    );
+    assert_eq!(
+        v["summary"]["analysis_finding_count"],
+        findings.as_array().unwrap().len()
+    );
+}
+
+#[test]
+fn test_inspect_never_reports_export_added_removed_or_signature_changed() {
+    let (rc, stdout, _) = run_cli(&["inspect", "tests/fixtures/test_soroban.wasm", "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let forbidden: Vec<&str> = vec!["export_added", "export_removed", "export_signature_changed"];
+    for f in v["analysis"]["findings"].as_array().unwrap() {
+        let code = f["code"].as_str().unwrap_or("");
+        assert!(
+            !forbidden.contains(&code),
+            "forbidden single-module change code: {code}"
+        );
+    }
+}
+
+#[test]
+fn test_inspect_text_output_lists_findings() {
+    let (rc, stdout, _) = run_cli(&["inspect", "/tmp/bad_type_idx.wasm"]);
+    assert_eq!(rc, 0);
+    assert!(
+        stdout.contains("export_unresolvable"),
+        "text output must include the finding code"
+    );
+}

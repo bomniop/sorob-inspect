@@ -200,6 +200,29 @@ fn run(cli: Cli) -> Result<(), String> {
             let bytes = read_wasm(&file)?;
             let mut report = inspect(&bytes, false).map_err(|e| e.to_string())?;
             report.analysis = Some(analyze(&bytes).map_err(|e| e.to_string())?);
+
+            // Single-module structural export observations: facts the inspected
+            // module establishes on its own, never change findings (no baseline).
+            let export_observations =
+                sorob_inspect::soroban::structural::export_findings(&report.exports);
+            if !export_observations.is_empty() {
+                let mut findings = report
+                    .analysis
+                    .as_ref()
+                    .map(|a| a.findings.clone())
+                    .unwrap_or_default();
+                for obs in export_observations {
+                    findings.push(sorob_inspect::wasm::Finding {
+                        code: obs.code,
+                        severity: "unknown".to_string(),
+                        message: obs.message,
+                    });
+                }
+                if let Some(a) = report.analysis.as_mut() {
+                    a.findings = findings;
+                }
+            }
+
             // Refresh the consolidated summary so `analysis_finding_count`
             // reflects the analysis that was just attached.
             report.summary =

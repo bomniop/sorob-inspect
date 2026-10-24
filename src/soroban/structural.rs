@@ -6,6 +6,15 @@
 //! section. This module covers the complementary case: the raw exported
 //! symbols of the WASM module itself, which every module has.
 //!
+//! # Single-module observations
+//!
+//! [`export_findings`] derives findings from ONE module. A single module
+//! establishes no baseline, so it never reports `export_added`,
+//! `export_removed`, or `export_signature_changed`: those require a comparison
+//! reference. What it does report is what the module itself proves — chiefly
+//! an export whose description cannot be resolved. Use [`diff_exports`] when a
+//! baseline exists.
+//!
 //! # What is compared
 //!
 //! Exports are keyed by **name + external kind** (`name [kind]`). A symbol
@@ -109,7 +118,10 @@ pub struct StructuralExportDiff {
 ///
 /// Returns `None` when the export is a function whose signature could not be
 /// resolved — the caller reports `unknown` rather than inventing one.
-fn describe(export: &ExportEntry) -> Option<String> {
+///
+/// Shared by the diff comparison and by the single-module `inspect` findings,
+/// so both paths resolve an export identically.
+pub fn describe_export(export: &ExportEntry) -> Option<String> {
     match export.kind.as_str() {
         "function" => export.type_sig.clone(),
         "memory" => export.memory.as_ref().map(|m| {
@@ -144,6 +156,55 @@ fn describe(export: &ExportEntry) -> Option<String> {
     }
 }
 
+/// A single-module observation about the module's exported public surface.
+///
+/// These are facts the inspected module establishes on its own. They are NOT
+/// change findings: a single module has no baseline, so nothing here asserts
+/// that an export was added, removed, or modified relative to anything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportObservation {
+    /// Stable machine-readable code. Currently only `export_unresolvable`.
+    pub code: String,
+    /// Export name.
+    pub name: String,
+    /// External kind (`function`, `memory`, `table`, `global`).
+    pub kind: String,
+    /// Why the observation was raised.
+    pub message: String,
+}
+
+/// Derive single-module observations from a module's exports.
+///
+/// The only code emitted today is `export_unresolvable`: an export whose
+/// resolved description is unavailable. For a function export that means the
+/// signature could not be resolved from the module's type section; for a
+/// memory/table/global export it means the corresponding detail was not
+/// collected.
+///
+/// Deliberately NOT emitted (they need a baseline that one module cannot
+/// provide): `export_added`, `export_removed`, `export_signature_changed`.
+/// Use [`diff_exports`] against a reference module for those.
+///
+/// Output is sorted by `(name, kind)` for deterministic ordering.
+pub fn export_findings(exports: &[ExportEntry]) -> Vec<ExportObservation> {
+    let mut out: Vec<ExportObservation> = exports
+        .iter()
+        .filter(|e| describe_export(e).is_none())
+        .map(|e| ExportObservation {
+            code: "export_unresolvable".to_string(),
+            name: e.name.clone(),
+            kind: e.kind.clone(),
+            message: format!(
+                "export '{}' [{}] has no resolvable description; \
+                 signature/bounds could not be determined from this module",
+                e.name, e.kind
+            ),
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.name, &a.kind).cmp(&(&b.name, &b.kind)));
+    out
+}
+
 /// Compare two modules' exports structurally.
 ///
 /// Both sides are keyed by `name [kind]`, so a name reused for a different
@@ -169,14 +230,14 @@ pub fn diff_exports(old: &[ExportEntry], new: &[ExportEntry]) -> StructuralExpor
                 kind: old_export.kind.clone(),
                 change: StructuralChangeKind::Removed,
                 compatibility: StructuralCompatibility::Breaking,
-                old: describe(old_export),
+                old: describe_export(old_export),
                 new: None,
             });
             continue;
         };
 
-        let old_desc = describe(old_export);
-        let new_desc = describe(new_export);
+        let old_desc = describe_export(old_export);
+        let new_desc = describe_export(new_export);
         let (change, compatibility) = match (&old_desc, &new_desc) {
             (Some(o), Some(n)) if o == n => continue,
             (Some(o), Some(n)) => {
@@ -211,7 +272,7 @@ pub fn diff_exports(old: &[ExportEntry], new: &[ExportEntry]) -> StructuralExpor
             change: StructuralChangeKind::Added,
             compatibility: StructuralCompatibility::NonBreaking,
             old: None,
-            new: describe(new_export),
+            new: describe_export(new_export),
         });
     }
 
@@ -476,5 +537,80 @@ mod tests {
         ];
         let d = diff_exports(&a, &b);
         assert_eq!(d.compatibility, "breaking");
+    }
+
+    #[test]
+    fn export_findings_empty_when_all_exports_resolve() {
+        let exports = vec![
+            func("hello", Some("() -> ()"), Some(0)),
+            mem("memory", 1, Some(4)),
+            glob("g", "i32", false),
+        ];
+        assert!(export_findings(&exports).is_empty());
+    }
+
+    #[test]
+    fn export_findings_reports_unresolvable_function_signature() {
+        let exports = vec![
+            func("resolved", Some("() -> ()"), Some(0)),
+            func("unresolved", None, Some(1)),
+        ];
+        let findings = export_findings(&exports);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "export_unresolvable");
+        assert_eq!(findings[0].name, "unresolved");
+        assert_eq!(findings[0].kind, "function");
+        assert!(findings[0].message.contains("unresolved"));
+    }
+
+    #[test]
+    fn export_findings_reports_unresolvable_non_function_export() {
+        // A memory export with no collected bounds detail is unresolvable.
+        let exports = vec![ExportEntry {
+            name: "mem".to_string(),
+            kind: "memory".to_string(),
+            index: 0,
+            type_sig: None,
+            type_index: None,
+            memory: None,
+            table: None,
+            global: None,
+        }];
+        let findings = export_findings(&exports);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "export_unresolvable");
+        assert_eq!(findings[0].kind, "memory");
+    }
+
+    #[test]
+    fn export_findings_never_reports_added_or_removed() {
+        // A single module has no baseline: no change codes may ever appear.
+        let exports = vec![
+            func("a", Some("() -> ()"), Some(0)),
+            func("b", None, Some(1)),
+        ];
+        for f in export_findings(&exports) {
+            assert_eq!(f.code, "export_unresolvable");
+            assert_ne!(f.code, "export_added");
+            assert_ne!(f.code, "export_removed");
+            assert_ne!(f.code, "export_signature_changed");
+        }
+    }
+
+    #[test]
+    fn export_findings_are_deterministically_ordered() {
+        let exports = vec![
+            func("zeta", None, Some(0)),
+            func("alpha", None, Some(1)),
+            func("mid", None, Some(2)),
+        ];
+        let findings = export_findings(&exports);
+        let names: Vec<&str> = findings.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn export_findings_empty_for_no_exports() {
+        assert!(export_findings(&[]).is_empty());
     }
 }
