@@ -2744,7 +2744,40 @@ fn test_inspect_exports_no_findings_when_all_resolve() {
 fn test_inspect_exports_unresolvable_signature_produces_finding() {
     // Fixture: real contract with the function's type index patched out of
     // range, so the signature cannot be resolved from the type section.
-    let (rc, stdout, _) = run_cli(&["inspect", "/tmp/bad_type_idx.wasm", "--json"]);
+    let mut bytes = std::fs::read("tests/fixtures/test_soroban.wasm").unwrap();
+    // function section body starts after id+size; patch the first type index
+    // to 2 (out of range for the 2-type fixture).
+    let mut i = 8;
+    while i < bytes.len() {
+        let sid = bytes[i];
+        i += 1;
+        let mut size = 0usize;
+        let mut shift = 0;
+        loop {
+            let b = bytes[i];
+            i += 1;
+            size |= ((b & 0x7F) as usize) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let body = i;
+        if sid == 3 {
+            // function section: first byte = count, then type indices
+            bytes[body + 1] = 2; // out-of-range type index
+            break;
+        }
+        i += size;
+    }
+    let f = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(f.path(), &bytes).unwrap();
+    let path = f.path().to_string_lossy().to_string();
+
+    let (rc, stdout, _) = run_cli(&["inspect", &path, "--json"]);
     assert_eq!(rc, 0, "inspect must not fail on unresolvable exports");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let findings = &v["analysis"]["findings"];
@@ -2796,7 +2829,37 @@ fn test_inspect_never_reports_export_added_removed_or_signature_changed() {
 
 #[test]
 fn test_inspect_text_output_lists_findings() {
-    let (rc, stdout, _) = run_cli(&["inspect", "/tmp/bad_type_idx.wasm"]);
+    let mut bytes = std::fs::read("tests/fixtures/test_soroban.wasm").unwrap();
+    let mut i = 8;
+    while i < bytes.len() {
+        let sid = bytes[i];
+        i += 1;
+        let mut size = 0usize;
+        let mut shift = 0;
+        loop {
+            let b = bytes[i];
+            i += 1;
+            size |= ((b & 0x7F) as usize) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let body = i;
+        if sid == 3 {
+            bytes[body + 1] = 2;
+            break;
+        }
+        i += size;
+    }
+    let f = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(f.path(), &bytes).unwrap();
+    let path = f.path().to_string_lossy().to_string();
+
+    let (rc, stdout, _) = run_cli(&["inspect", &path]);
     assert_eq!(rc, 0);
     assert!(
         stdout.contains("export_unresolvable"),
