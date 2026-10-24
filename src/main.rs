@@ -60,6 +60,11 @@ enum Command {
         /// meaningful when `--target-protocol` is given.
         #[arg(long, value_name = "PRE_RELEASE")]
         host_pre_release: Option<u32>,
+        /// Exit non-zero when the protocol assessment is `rejected`. Requires
+        /// `--target-protocol`. Does NOT fire on `not_assessable` (missing or
+        /// undecodable metadata), and is independent of `--fail-on-breaking`.
+        #[arg(long)]
+        fail_if_rejected: bool,
     },
     /// Structural diff between two WASM artifacts.
     ///
@@ -101,6 +106,11 @@ enum Command {
         /// Requires `--target-protocol`.
         #[arg(long, value_name = "PRE_RELEASE")]
         host_pre_release: Option<u32>,
+        /// Exit non-zero when either assessed side is `rejected`. Requires
+        /// `--target-protocol`. Does NOT fire on `not_assessable`; independent
+        /// of `--fail-on-breaking`.
+        #[arg(long)]
+        fail_if_rejected: bool,
     },
 }
 
@@ -164,6 +174,26 @@ fn build_assessment_inputs(
     }
 }
 
+/// Whether a report carries an actual `rejected` assessment verdict.
+///
+/// `not_applicable` (missing or undecodable metadata) is deliberately NOT
+/// treated as rejected, so `--fail-if-rejected` never fires on unavailable
+/// assessment.
+fn is_rejected(report: Option<&sorob_inspect::soroban::EnvMetaReport>) -> bool {
+    report
+        .and_then(|r| r.assessment.as_ref())
+        .map(|a| a.verdict == "rejected")
+        .unwrap_or(false)
+}
+
+/// `--fail-if-rejected` is only meaningful alongside `--target-protocol`.
+fn require_target_for_gate(fail_if_rejected: bool, has_inputs: bool) -> Result<(), String> {
+    if fail_if_rejected && !has_inputs {
+        return Err("--fail-if-rejected requires --target-protocol to assess against".to_string());
+    }
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Inspect { file, json } => {
@@ -186,6 +216,7 @@ fn run(cli: Cli) -> Result<(), String> {
             target_protocol,
             host_protocol,
             host_pre_release,
+            fail_if_rejected,
         } => {
             let bytes = read_wasm(&file)?;
             let mut report = inspect_soroban(&bytes, true).map_err(|e| e.to_string())?;
@@ -195,6 +226,7 @@ fn run(cli: Cli) -> Result<(), String> {
             // Shared with `diff` so both commands enforce identical validation.
             let assessment_inputs =
                 build_assessment_inputs(target_protocol, host_protocol, host_pre_release)?;
+            require_target_for_gate(fail_if_rejected, assessment_inputs.is_some())?;
 
             if let Some(inputs) = assessment_inputs.as_ref() {
                 if let Some(em) = report.env_meta.as_mut() {
@@ -288,6 +320,19 @@ fn run(cli: Cli) -> Result<(), String> {
                     "note: contract-spec decoding implemented; full ABI compatibility not assessed."
                 );
             }
+            // Gate: after the report is emitted, fail on a `rejected` verdict.
+            // `not_applicable` (missing/undecodable) is intentionally excluded.
+            if fail_if_rejected && is_rejected(report.env_meta.as_ref()) {
+                let reason = report
+                    .env_meta
+                    .as_ref()
+                    .and_then(|em| em.assessment.as_ref())
+                    .map(|a| a.reason.as_str())
+                    .unwrap_or("environment interface-version rejected");
+                return Err(format!(
+                    "environment interface-version assessment rejected: {reason}"
+                ));
+            }
         }
         Command::Diff {
             old,
@@ -297,6 +342,7 @@ fn run(cli: Cli) -> Result<(), String> {
             target_protocol,
             host_protocol,
             host_pre_release,
+            fail_if_rejected,
         } => {
             let old_bytes = read_wasm(&old)?;
             let new_bytes = read_wasm(&new)?;
@@ -325,6 +371,7 @@ fn run(cli: Cli) -> Result<(), String> {
             // side *before* diffing so `transition` reflects both assessments.
             let assessment_inputs =
                 build_assessment_inputs(target_protocol, host_protocol, host_pre_release)?;
+            require_target_for_gate(fail_if_rejected, assessment_inputs.is_some())?;
             let assessed = assessment_inputs.is_some();
             if let Some(inputs) = assessment_inputs.as_ref() {
                 if let Some(em) = old_env_meta.as_mut() {
@@ -446,6 +493,18 @@ fn run(cli: Cli) -> Result<(), String> {
                 if fail {
                     return Err("spec-level compatibility is breaking or unknown".to_string());
                 }
+            }
+            // Independent gate: fail only on an actual `rejected` verdict.
+            // `not_applicable` (missing/undecodable) and `not_assessable` sides do
+            // not trigger this.
+            if fail_if_rejected
+                && (is_rejected(env_meta_diff.old.as_ref())
+                    || is_rejected(env_meta_diff.new.as_ref()))
+            {
+                return Err(
+                    "environment interface-version assessment rejected on one or more sides"
+                        .to_string(),
+                );
             }
         }
     }

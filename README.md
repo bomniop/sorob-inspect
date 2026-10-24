@@ -167,9 +167,21 @@ Flags (on `validate` and `diff`; identical validation in both):
 `verdict` is `accepted`, `rejected`, or `not_applicable` (when the section is
 absent or undecodable). When no `contractenvmetav0` section exists, the
 assessment reports `NOT ASSESSED`. The `reason` echoes the host's exact
-rejection message. Exit-code behavior is unchanged: an assessment never fails
-the command; the verdict is informational only (grep `env_meta.assessment.verdict`
-in CI if you need a gate).
+rejection message. Without `--fail-if-rejected`, the assessment is informational
+only (grep `env_meta.assessment.verdict` in CI if you need a gate).
+
+#### Exit-code gate (`--fail-if-rejected`)
+
+`--fail-if-rejected` exits non-zero when the explicit assessment is `rejected`.
+It requires `--target-protocol`; it does NOT fire on `not_applicable`
+(missing/undecodable metadata). It is independent of `--fail-on-breaking`
+(spec-level verdict). When both flags are specified, either applicable failure
+condition exits 1.
+
+- `validate`: fails when the single module's assessment is `rejected`.
+- `diff`: fails when either side's assessment is `rejected`.
+- `not_applicable` / `not_assessable` (no `--target-protocol` supplied, or a
+  side has no decodable version) never triggers the gate.
 
 #### Assessing both sides of a `diff`
 

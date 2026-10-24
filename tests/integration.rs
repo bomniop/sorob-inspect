@@ -2136,6 +2136,100 @@ fn test_validate_env_meta_assessment_bad_args() {
 }
 
 #[test]
+fn test_validate_fail_if_rejected_rejected_verdict_exits_one() {
+    // protocol 28 vs target 27 -> future rejection -> --fail-if-rejected must exit 1.
+    let (rc, _, stderr) = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--target-protocol",
+        "27",
+        "--fail-if-rejected",
+    ]);
+    assert_eq!(rc, 1, "rejected verdict must fail when gated");
+    assert!(
+        stderr.contains("environment interface-version assessment rejected"),
+        "stderr surfaces the reason"
+    );
+}
+
+#[test]
+fn test_validate_fail_if_rejected_accepted_verdict_exits_zero() {
+    let (rc, _, _) = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--target-protocol",
+        "28",
+        "--fail-if-rejected",
+    ]);
+    assert_eq!(rc, 0, "accepted verdict must not fail");
+}
+
+#[test]
+fn test_validate_fail_if_rejected_requires_target_protocol() {
+    let (rc, _, _) = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--fail-if-rejected",
+    ]);
+    assert_eq!(
+        rc, 1,
+        "--fail-if-rejected without --target-protocol must error"
+    );
+}
+
+#[test]
+fn test_validate_fail_if_rejected_undecodable_does_not_fire() {
+    // undecodable -> not_applicable -> not rejected -> gate must stay silent.
+    let bytes = std::fs::read("tests/fixtures/test_soroban.wasm").unwrap();
+    // Corrupt the section payload so XDR decoding fails (bad discriminant).
+    let mut bad = bytes.clone();
+    // Locate the payload via the same walker the tests use.
+    let mut i = 8;
+    let mut payload_off = None;
+    while i < bad.len() {
+        let id = bad[i];
+        i += 1;
+        let mut size = 0usize;
+        let mut shift = 0;
+        loop {
+            let b = bad[i];
+            i += 1;
+            size |= ((b & 0x7F) as usize) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let body = i;
+        if id == 0 {
+            let nl = bad[body] as usize;
+            let name = std::str::from_utf8(&bad[body + 1..body + 1 + nl]).unwrap();
+            if name == "contractenvmetav0" {
+                payload_off = Some(body + 1 + nl);
+                break;
+            }
+        }
+        i += size;
+    }
+    let off = payload_off.expect("env meta section present");
+    bad[off] = 1; // invalid union discriminant
+    let f = tempfile::Builder::new().suffix(".wasm").tempfile().unwrap();
+    std::fs::write(f.path(), &bad).unwrap();
+    let path = f.path().to_string_lossy().to_string();
+    let (rc, _, _) = run_cli(&[
+        "validate",
+        &path,
+        "--target-protocol",
+        "28",
+        "--fail-if-rejected",
+    ]);
+    assert_eq!(
+        rc, 0,
+        "undecodable (not_applicable) must not trigger --fail-if-rejected"
+    );
+}
+
+#[test]
 fn test_validate_env_meta_diagnostic_in_json() {
     // A decoded version surfaces the host's acceptance rule + required inputs,
     // never a verdict.
@@ -2418,5 +2512,121 @@ fn test_diff_env_meta_assessment_text_output() {
     assert!(
         stdout.contains("new: ACCEPTED"),
         "text prints the new verdict"
+    );
+}
+
+// --- diff: --fail-if-rejected ---
+
+#[test]
+fn test_diff_fail_if_rejected_rejected_old_side_exits_one() {
+    let (_oa, opath) = patched_env_meta_wasm(28, 0);
+    let (_na, npath) = patched_env_meta_wasm(27, 0);
+    let (rc, _, stderr) = run_cli(&[
+        "diff",
+        &opath,
+        &npath,
+        "--target-protocol",
+        "27",
+        "--fail-if-rejected",
+    ]);
+    assert_eq!(rc, 1, "rejected old side must fail");
+    assert!(
+        stderr.contains("environment interface-version assessment rejected"),
+        "stderr surfaces the reason"
+    );
+}
+
+#[test]
+fn test_diff_fail_if_rejected_rejected_new_side_exits_one() {
+    let (_oa, opath) = patched_env_meta_wasm(27, 0);
+    let (_na, npath) = patched_env_meta_wasm(28, 0);
+    let (rc, _, stderr) = run_cli(&[
+        "diff",
+        &opath,
+        &npath,
+        "--target-protocol",
+        "27",
+        "--fail-if-rejected",
+    ]);
+    assert_eq!(rc, 1, "rejected new side must fail");
+    assert!(
+        stderr.contains("environment interface-version assessment rejected"),
+        "stderr surfaces the reason"
+    );
+}
+
+#[test]
+fn test_diff_fail_if_rejected_accepted_sides_exit_zero() {
+    let (_oa, opath) = patched_env_meta_wasm(28, 0);
+    let (_na, npath) = patched_env_meta_wasm(28, 0);
+    let (rc, _, _) = run_cli(&[
+        "diff",
+        &opath,
+        &npath,
+        "--target-protocol",
+        "28",
+        "--fail-if-rejected",
+    ]);
+    assert_eq!(rc, 0, "accepted sides must not fail");
+}
+
+#[test]
+fn test_diff_fail_if_rejected_not_assessable_side_exits_zero() {
+    let empty = tempfile::Builder::new()
+        .suffix(".wasm")
+        .tempfile()
+        .expect("temp file");
+    std::fs::write(
+        empty.path(),
+        [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    )
+    .unwrap();
+    let empty_path = empty.path().to_string_lossy().to_string();
+    let (_oa, opath) = patched_env_meta_wasm(28, 0);
+    let (rc, _, _) = run_cli(&[
+        "diff",
+        &opath,
+        &empty_path,
+        "--target-protocol",
+        "28",
+        "--fail-if-rejected",
+    ]);
+    assert_eq!(
+        rc, 0,
+        "not_assessable side must not trigger --fail-if-rejected"
+    );
+}
+
+#[test]
+fn test_diff_fail_if_rejected_requires_target_protocol() {
+    let (_oa, opath) = patched_env_meta_wasm(28, 0);
+    let (_na, npath) = patched_env_meta_wasm(27, 0);
+    let (rc, _, _) = run_cli(&["diff", &opath, &npath, "--fail-if-rejected"]);
+    assert_eq!(
+        rc, 1,
+        "--fail-if-rejected without --target-protocol must error"
+    );
+}
+
+#[test]
+fn test_diff_fail_if_rejected_and_fail_on_breaking_independent() {
+    // test_soroban.wasm vs itself: spec is identical (non-breaking), env is
+    // rejected (28 vs target 27). --fail-on-breaking must NOT fire;
+    // --fail-if-rejected MUST fire.
+    let (_oa, opath) = patched_env_meta_wasm(28, 0);
+    let (_na, npath) = patched_env_meta_wasm(27, 0);
+    let (rc, _, stderr) = run_cli(&[
+        "diff",
+        &opath,
+        &npath,
+        "--target-protocol",
+        "27",
+        "--fail-if-rejected",
+        "--fail-on-breaking",
+    ]);
+    assert_eq!(rc, 1, "--fail-if-rejected must fire");
+    assert!(
+        stderr.contains("environment interface-version assessment rejected"),
+        "stderr surfaces the env rejection"
     );
 }
