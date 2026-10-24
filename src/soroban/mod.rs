@@ -74,6 +74,11 @@ pub struct EnvMetaReport {
     /// [`INTERFACE_VERSION_DIAGNOSTIC`] for why no verdict can be rendered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+    /// Compatibility assessment against an explicitly supplied target protocol.
+    /// Present only when the operator supplied `--target-protocol`; otherwise
+    /// the version is decoded but deliberately left unassessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<EnvMetaAssessment>,
 }
 
 /// Actionable guidance attached to every decoded interface version.
@@ -99,6 +104,126 @@ only when pre_release is 0 (older protocols are finalized). This tool has no \
 access to the target ledger protocol or to the running host's interface \
 version, so it cannot decide acceptance. Evaluate this value against the target \
 network's current ledger protocol.";
+
+/// Operator-supplied inputs for assessing a decoded interface version against
+/// the Soroban host's acceptance rule.
+///
+/// These mirror the arguments `soroban-env-host` receives at runtime. SorobInspect
+/// has no way to obtain them automatically, so they must be supplied explicitly
+/// via the CLI. See [`assess_env_meta`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnvMetaAssessmentInputs {
+    /// Target network's current ledger protocol (`curr_ledger_protocol`).
+    pub curr_ledger_protocol: u32,
+    /// Host's compiled protocol (`host_protocol`; `meta::INTERFACE_VERSION.protocol`).
+    pub host_protocol: u32,
+    /// Host's compiled pre-release (`meta::INTERFACE_VERSION.pre_release`).
+    pub host_pre_release: u32,
+}
+
+/// Outcome of applying the host's interface-version acceptance rule
+/// (line 322-400 of `soroban-env-host 28.0.2`, production / non-`next` build)
+/// to a decoded interface version.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnvMetaAssessment {
+    /// `accepted`, `rejected`, or `not_applicable` (when the version could not
+    /// be decoded).
+    pub verdict: String,
+    /// The host's exact rejection reason, or a human explanation of acceptance.
+    pub reason: String,
+    /// The inputs the assessment was run with.
+    pub inputs: EnvMetaAssessmentInputs,
+    /// `got_proto`: the module's declared protocol.
+    pub got_protocol: u32,
+    /// The module's declared pre-release.
+    pub got_pre_release: u32,
+    /// `want_proto = min(curr_ledger_protocol, host_protocol)`.
+    pub want_protocol: u32,
+}
+
+/// Apply the Soroban host's `check_contract_interface_version` rule
+/// (production / non-`next` semantics) to a decoded environment interface
+/// version.
+///
+/// Returns `verdict: "not_applicable"` when `report` is not `decoded`. The
+/// host itself rejects `curr_ledger_protocol > host_protocol` as an internal
+/// error ("ledger protocol number is ahead of supported env protocol number");
+/// callers should treat such inputs as contradictory rather than passing them
+/// here — the verdict strings below otherwise mirror the host's error messages
+/// verbatim.
+///
+/// `pre_release` checks are modeled for stable (`non-next`) builds, which is the
+/// only mode SorobInspect can represent (it does not depend on the `next`
+/// feature of `soroban-env-host`).
+pub fn assess_env_meta(
+    report: &EnvMetaReport,
+    inputs: &EnvMetaAssessmentInputs,
+) -> EnvMetaAssessment {
+    let got_protocol = report.protocol.unwrap_or(0);
+    let got_pre_release = report.pre_release.unwrap_or(0);
+    let want_protocol = inputs.curr_ledger_protocol.min(inputs.host_protocol);
+    let (verdict, reason) = match report.status.as_str() {
+        "decoded" => {
+            let want_pre = inputs.host_pre_release;
+            if got_protocol > want_protocol {
+                (
+                    "rejected",
+                    "contract protocol number is newer than host".to_string(),
+                )
+            } else if got_protocol == want_protocol {
+                if got_pre_release == want_pre {
+                    (
+                        "accepted",
+                        format!(
+                            "protocol and pre-release match the host (want_proto={}, host_pre_release={})",
+                            want_protocol, want_pre
+                        ),
+                    )
+                } else {
+                    (
+                        "rejected",
+                        "contract pre-release number for current protocol does not match host"
+                            .to_string(),
+                    )
+                }
+            } else {
+                if got_pre_release == 0 {
+                    (
+                        "accepted",
+                        format!(
+                            "older finalized protocol with zero pre-release (want_proto={})",
+                            want_protocol
+                        ),
+                    )
+                } else {
+                    (
+                        "rejected",
+                        "contract pre-release number for old protocol is nonzero".to_string(),
+                    )
+                }
+            }
+        }
+        "undecodable" => (
+            "not_applicable",
+            report
+                .error
+                .clone()
+                .unwrap_or_else(|| "env meta undecodable".to_string()),
+        ),
+        other => (
+            "not_applicable",
+            format!("unknown env_meta status: {other}"),
+        ),
+    };
+    EnvMetaAssessment {
+        verdict: verdict.to_string(),
+        reason,
+        inputs: inputs.clone(),
+        got_protocol,
+        got_pre_release,
+        want_protocol,
+    }
+}
 
 /// Decoded contract-spec contents.
 #[derive(Debug, Serialize, Deserialize)]
@@ -375,6 +500,7 @@ pub fn decode_env_meta_raw(raw: &[u8]) -> EnvMetaReport {
             pre_release: Some(v.pre_release),
             error: None,
             diagnostic: Some(INTERFACE_VERSION_DIAGNOSTIC.to_string()),
+            assessment: None,
         },
         Some(Err(e)) => EnvMetaReport {
             status: "undecodable".to_string(),
@@ -382,6 +508,7 @@ pub fn decode_env_meta_raw(raw: &[u8]) -> EnvMetaReport {
             pre_release: None,
             error: Some(format!("contractenvmetav0 decode failed: {e}")),
             diagnostic: None,
+            assessment: None,
         },
         None => EnvMetaReport {
             status: "undecodable".to_string(),
@@ -389,6 +516,7 @@ pub fn decode_env_meta_raw(raw: &[u8]) -> EnvMetaReport {
             pre_release: None,
             error: Some("contractenvmetav0 is empty".to_string()),
             diagnostic: None,
+            assessment: None,
         },
     }
 }

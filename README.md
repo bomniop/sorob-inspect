@@ -131,6 +131,58 @@ lookup to guess them. Rather than emit an unsound verdict, the decoded value is
 reported with the `diagnostic` text above so the operator can evaluate it
 against their target network.
 
+### Compatibility assessment (`--target-protocol`)
+
+The operator can request an explicit assessment by supplying the target
+network's current ledger protocol. This applies the **exact** host rule above
+using operator-supplied numbers — it is **not** a live-network verification, and
+this tool never performs a network lookup on its own.
+
+```json
+"env_meta": {
+  "status": "decoded",
+  "protocol": 28,
+  "pre_release": 0,
+  "diagnostic": "...",
+  "assessment": {
+    "verdict": "rejected",
+    "reason": "contract protocol number is newer than host",
+    "inputs": { "curr_ledger_protocol": 27, "host_protocol": 27, "host_pre_release": 0 },
+    "got_protocol": 28,
+    "got_pre_release": 0,
+    "want_protocol": 27
+  }
+}
+```
+
+Flags (only on `validate`):
+
+- `--target-protocol <N>`: target network's current ledger protocol. Required
+  to enable the assessment. Must be `>= 1`.
+- `--host-protocol <M>`: host's compiled protocol. Defaults to `--target-protocol`
+  (a host that supports the network's protocol). Requires `--target-protocol`.
+- `--host-pre-release <R>`: host's compiled pre-release. Defaults to `0` (a stable
+  host). Requires `--target-protocol`.
+
+`verdict` is `accepted`, `rejected`, or `not_applicable` (when the section is
+absent or undecodable). When no `contractenvmetav0` section exists, the
+assessment reports `NOT ASSESSED`. The `reason` echoes the host's exact
+rejection message. Exit-code behavior is unchanged: an assessment never fails
+the command; the verdict is informational only (grep `env_meta.assessment.verdict`
+in CI if you need a gate).
+
+Argument validation (all non-zero exit, no report):
+
+- `--host-protocol`/`--host-pre-release` without `--target-protocol`.
+- `--target-protocol 0` or `--host-protocol 0`.
+- `--target-protocol` greater than `--host-protocol` (a host cannot validate a
+  network running a newer protocol than itself).
+
+The assessment is only as reliable as the operator-supplied protocol values:
+this is an offline check of the decoded version against declared numbers, not a
+probe of the running network.
+
+
 ## Compatibility diff rules
 
 The `diff` command reports structural changes (imports/exports/custom sections)

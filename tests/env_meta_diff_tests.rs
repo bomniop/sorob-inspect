@@ -9,6 +9,7 @@ fn decoded(protocol: u32, pre_release: u32) -> EnvMetaReport {
         pre_release: Some(pre_release),
         error: None,
         diagnostic: Some(sorob_inspect::soroban::INTERFACE_VERSION_DIAGNOSTIC.to_string()),
+        assessment: None,
     }
 }
 
@@ -19,6 +20,7 @@ fn undecodable() -> EnvMetaReport {
         pre_release: None,
         error: Some("bad payload".to_string()),
         diagnostic: None,
+        assessment: None,
     }
 }
 

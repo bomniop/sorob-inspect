@@ -2028,6 +2028,114 @@ fn test_diff_env_meta_change_does_not_trigger_fail_on_breaking() {
 }
 
 #[test]
+fn test_validate_env_meta_assessment_json_rejected() {
+    // got_proto 28 > want_proto 27 -> future rejection, exact host reason.
+    let (rc, stdout, _) = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--target-protocol",
+        "27",
+        "--json",
+    ]);
+    assert_eq!(rc, 0, "assessment is informational, exit code unchanged");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let a = &v["env_meta"]["assessment"];
+    assert_eq!(a["verdict"], "rejected");
+    assert_eq!(a["reason"], "contract protocol number is newer than host");
+    assert_eq!(a["got_protocol"], 28);
+    assert_eq!(a["want_protocol"], 27);
+    assert_eq!(a["inputs"]["curr_ledger_protocol"], 27);
+    assert_eq!(a["inputs"]["host_protocol"], 27);
+    assert_eq!(a["inputs"]["host_pre_release"], 0);
+}
+
+#[test]
+fn test_validate_env_meta_assessment_json_accepted() {
+    // got_proto 28 == want_proto 28, pre 0 == host_pre 0 -> accepted.
+    let (rc, stdout, _) = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--target-protocol",
+        "28",
+        "--json",
+    ]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let a = &v["env_meta"]["assessment"];
+    assert_eq!(a["verdict"], "accepted");
+    assert_eq!(a["got_protocol"], 28);
+    assert_eq!(a["want_protocol"], 28);
+}
+
+#[test]
+fn test_validate_env_meta_assessment_text_and_hint() {
+    let (rc, stdout, _) = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--target-protocol",
+        "27",
+    ]);
+    assert_eq!(rc, 0);
+    assert!(
+        stdout.contains("env interface version assessment: REJECTED"),
+        "text prints the verdict"
+    );
+    assert!(
+        stdout.contains("evaluate against the target network's ledger protocol"),
+        "text prints the actionable hint"
+    );
+}
+
+#[test]
+fn test_validate_env_meta_assessment_bad_args() {
+    let bad_host = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--host-protocol",
+        "28",
+    ]);
+    assert_eq!(
+        bad_host.0, 1,
+        "--host-protocol without --target-protocol errors"
+    );
+
+    let bad_zero = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--target-protocol",
+        "0",
+    ]);
+    assert_eq!(bad_zero.0, 1, "--target-protocol 0 errors");
+
+    let bad_order = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--target-protocol",
+        "30",
+        "--host-protocol",
+        "28",
+    ]);
+    assert_eq!(bad_order.0, 1, "target > host errors");
+
+    let non_numeric = run_cli(&[
+        "validate",
+        "tests/fixtures/test_soroban.wasm",
+        "--target-protocol",
+        "abc",
+    ]);
+    assert_eq!(non_numeric.0, 2, "non-numeric value is a clap parse error");
+
+    // Without --target-protocol there is no assessment and no error (legacy path).
+    let (rc, stdout, _) = run_cli(&["validate", "tests/fixtures/test_soroban.wasm", "--json"]);
+    assert_eq!(rc, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert!(
+        v["env_meta"].get("assessment").is_none(),
+        "no assessment when flag omitted"
+    );
+}
+
+#[test]
 fn test_validate_env_meta_diagnostic_in_json() {
     // A decoded version surfaces the host's acceptance rule + required inputs,
     // never a verdict.

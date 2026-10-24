@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use sorob_inspect::soroban::inspect_soroban;
+use sorob_inspect::soroban::{assess_env_meta, EnvMetaAssessmentInputs};
 use sorob_inspect::wasm::{
     analyze, inspect, DataSegmentMode, ElementExpr, ElementItem, ElementKind, ElementRefResolution,
     ElementSegmentMode, OffsetExpr, WasmReport,
@@ -43,6 +44,22 @@ enum Command {
         /// Emit JSON instead of human-readable text
         #[arg(long)]
         json: bool,
+        /// Target network's current ledger protocol. When supplied together
+        /// with an environment interface version, attaches a compatibility
+        /// assessment under `env_meta.assessment` using the Soroban host's
+        /// exact acceptance rule. The assessment is informational only and
+        /// never changes the exit code.
+        #[arg(long, value_name = "PROTOCOL")]
+        target_protocol: Option<u32>,
+        /// Host's compiled protocol (host_protocol). Required only when
+        /// `--target-protocol` is given; defaults to the target protocol
+        /// (i.e. a host that supports the network's protocol).
+        #[arg(long, value_name = "PROTOCOL")]
+        host_protocol: Option<u32>,
+        /// Host's compiled pre-release. Defaults to 0 (a stable host). Only
+        /// meaningful when `--target-protocol` is given.
+        #[arg(long, value_name = "PRE_RELEASE")]
+        host_pre_release: Option<u32>,
     },
     /// Structural diff between two WASM artifacts.
     ///
@@ -102,9 +119,58 @@ fn run(cli: Cli) -> Result<(), String> {
                 print_wasm_report(&file, &report);
             }
         }
-        Command::Validate { file, json } => {
+        Command::Validate {
+            file,
+            json,
+            target_protocol,
+            host_protocol,
+            host_pre_release,
+        } => {
             let bytes = read_wasm(&file)?;
-            let report = inspect_soroban(&bytes, true).map_err(|e| e.to_string())?;
+            let mut report = inspect_soroban(&bytes, true).map_err(|e| e.to_string())?;
+
+            // Explicit protocol inputs. Nothing is assumed: an assessment is
+            // produced only when the operator supplies the target protocol.
+            let assessment_inputs = match target_protocol {
+                None => {
+                    if host_protocol.is_some() || host_pre_release.is_some() {
+                        return Err(
+                            "--host-protocol and --host-pre-release require --target-protocol"
+                                .to_string(),
+                        );
+                    }
+                    None
+                }
+                Some(target) => {
+                    if target == 0 {
+                        return Err("--target-protocol must be >= 1".to_string());
+                    }
+                    let host = host_protocol.unwrap_or(target);
+                    if host == 0 {
+                        return Err("--host-protocol must be >= 1".to_string());
+                    }
+                    if target > host {
+                        return Err(format!(
+                            "--target-protocol ({target}) exceeds --host-protocol ({host}): \
+                             the host cannot validate a network running a newer protocol \
+                             than the host supports"
+                        ));
+                    }
+                    Some(EnvMetaAssessmentInputs {
+                        curr_ledger_protocol: target,
+                        host_protocol: host,
+                        host_pre_release: host_pre_release.unwrap_or(0),
+                    })
+                }
+            };
+
+            if let Some(inputs) = assessment_inputs.as_ref() {
+                if let Some(em) = report.env_meta.as_mut() {
+                    let assessment = assess_env_meta(em, inputs);
+                    em.assessment = Some(assessment);
+                }
+            }
+
             if json {
                 print_json(&report)?;
             } else {
@@ -135,6 +201,28 @@ fn run(cli: Cli) -> Result<(), String> {
                             em.error.clone().unwrap_or_default()
                         );
                     }
+                    if let Some(a) = &em.assessment {
+                        println!(
+                            "env interface version assessment: {} — {}",
+                            a.verdict.to_uppercase(),
+                            a.reason
+                        );
+                        println!(
+                            "  (got protocol {}/pre-release {} vs want_proto {}; \
+                             target {} / host {} / host pre-release {})",
+                            a.got_protocol,
+                            a.got_pre_release,
+                            a.want_protocol,
+                            a.inputs.curr_ledger_protocol,
+                            a.inputs.host_protocol,
+                            a.inputs.host_pre_release
+                        );
+                    }
+                } else if target_protocol.is_some() {
+                    println!(
+                        "env interface version assessment: NOT ASSESSED — \
+                         module has no contractenvmetav0 section"
+                    );
                 }
                 if let Some(c) = &report.consistency {
                     println!("--- spec/export consistency ---");
